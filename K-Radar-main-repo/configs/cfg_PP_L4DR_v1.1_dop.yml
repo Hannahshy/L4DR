@@ -1,0 +1,375 @@
+### ----- General ----- ###
+GENERAL:
+  NAME: 'cfg_PP_L4DR_v1.1_dop'         # 配置文件名称
+  COMMENT1: 'Driving corridor, LR 0.001~0.0001'  # 配置说明1：用于驾驶走廊，学习率范围
+  COMMENT2: 'Adam'                 # 配置说明2：优化器为Adam
+  VERSION: '1.1_dop'                   # 版本号
+  SEED: 2025                       # 随机种子，保证实验可复现
+  IS_CUDA_SEED: True               # 是否使用CUDA相关的随机种子
+  IS_DETERMINISTIC: True           # 是否启用确定性，保证结果一致
+  DEVICE: 'gpu'                    # 运行设备类型，通常为gpu
+  RESUME:                          # 训练恢复相关参数
+    IS_RESUME: False               # 是否从中断处恢复训练
+    PATH_EXP: '/mnt/sdb/L4DR/K-Radar-main-repo/logs/cfg_PP_L4DR_v1.1_dop/train_none/' # 训练模型恢复路径
+    START_EP:                     # 从第几轮(epoch)开始恢复，默认空
+    IS_COPY_LOGS: False             # 恢复时是否拷贝日志
+
+  LOGGING:                         # 日志相关设置
+    IS_LOGGING: True               # 是否开启日志记录
+    PATH_LOGGING: './logs'         # 日志保存路径
+    IS_SAVE_MODEL: True            # 是否保存模型
+    INTERVAL_EPOCH_MODEL: 1        # 每隔多少epoch保存一次模型
+    INTERVAL_EPOCH_UTIL: 1         # 每隔多少epoch记录一次utils信息，辅助分析
+### ----- General ----- ###
+
+DATASET:
+  NAME: 'KRadarDetection_v2_0'     # 数据集名称
+
+  NUM:                             # 采样帧总数，留空表示自动计算
+
+  path_data:                       # 路径相关配置
+    list_dir_kradar: ['/mnt/sdb/kradar_dataset']   # 原始K-Radar数据集路径
+    split: ['./resources/split/train.txt', './resources/split/test.txt'] # 训练/测试集划分文件
+    revised_label_v1_1: './tools/revise_label/kradar_revised_label_v1_1' # 标签v1.1
+    revised_label_v2_0: './tools/revise_label/kradar_revised_label_v2_0/KRadar_refined_label_by_UWIPL' # 标签v2.0
+    revised_label_v2_1: './tools/kradar_revised_label_v2_1/KRadar_revised_visibility' # 标签v2.1
+  label_version: 'v2_1'            # 当前使用的标签版本
+  item: {                          # 数据项选择（哪些传感器/数据使用）
+    'calib': True,                 # 是否使用标定数据
+    'ldr64': True,                 # 是否用64线激光雷达
+    'ldr128': False,               # 是否用128线激光雷达
+    'rdr': False,                  # 是否用原始稠密雷达
+    'rdr_sparse': True,            # 是否用稀疏雷达数据
+    'cam': False,                  # 是否用摄像头数据
+  }
+  calib: {
+    'z_offset': 0.7                # 标定z轴偏移量
+  }
+  ldr64: {                         # 64线激光雷达相关参数
+    'processed': False,            # 是否为预处理过的数据
+    'skip_line': 13,               # 跳过的行数
+    'n_attr': 9,                   # 属性数量
+    'inside_ldr64': True,          # 是否仅用内部点
+    'calib': True,                 # 是否用标定参数
+    'n_used': 4,                   # 使用的特征数目（如x,y,z,intensity）
+  }
+  rdr: {
+    'cube': False,                 # 是否以cube形式处理
+  }
+  rdr_sparse: {                    # 稀疏雷达数据参数
+    'processed': True,             # 是否为预处理数据
+    'dir': '/mnt/sdb/rtnh_wider_1p_1_doppler',  # 数据目录
+    'n_used': 5,                   # 使用的特征数目
+    'sample_points': 10240,         # 每帧点数 10240
+    'use_doppler':True,
+    'doppler_idx':4,
+    'power_idx': 3,  # power 数据列索引
+
+    # Doppler 数据预过滤设置
+    'doppler_denoise': {
+      'enabled': True,  # 是否启用 Doppler 预处理
+      'method': 'mad',  # 过滤方法：'mad'
+      'mad_mul': 4.0,  # 当使用MAD过滤时，设置倍数
+    },
+  }
+  roi: {                           # 感兴趣区域（ROI）相关参数
+    'filter': True,                # 是否启用过滤
+    'xyz': [0.,-6.4,-2.,72.,6.4,6.0], # xyz空间范围，[x_min, y_min, z_min, x_max, y_max, z_max]
+    'keys': ['rdr_sparse'],        # 过滤对象的关键字
+    'check_azimuth_for_rdr': False,# 是否检查方位角
+    'azimuth_deg': [-180,180],     # 方位角限制
+    'grid_size': ,                 # 网格尺寸（留空时自动计算）
+    'voxel_size': [0.15, 0.16, 8], # 体素尺寸（xyz）
+  }
+  label: {                         # 标签相关设置
+    'calib':            True,      # 是否用标定
+    'onlyR':            False,     # 是否仅用R通道
+    'consider_cls':     True,      # 是否考虑类别
+    'consider_roi':     True,      # 是否考虑ROI
+    'remove_0_obj':     True,      # 是否去除0对象
+    'Sedan':            [True,  1,  [0, 1, 0],       [0,255,0]],         # 各类目标：是否参与、类别索引、显示颜色（RGB/BGR）
+    'Bus or Truck':     [False, -1, [1, 0.2, 0],     [0,50,255]],        # ... 以此类推
+    'Motorcycle':       [False, -1, [1, 0, 0],       [0,0,255]],
+    'Bicycle':          [False, -1, [1, 1, 0],       [0,255,255]],
+    'Bicycle Group':    [False, -1, [0, 0.5, 1],     [0,128,255]],
+    'Pedestrian':       [False, -1, [0, 0, 1],       [255,0,0]],
+    'Pedestrian Group': [False, -1, [0.4, 0, 1],     [255,0,100]],
+    'Label':            [False, -1, [0.5, 0.5, 0.5], [128,128,128]],
+  }
+  collate_fn: 'v2_0'               # 数据合并函数（如何组batch）
+  load_from_pickle: './pkl'        # 是否从pickle文件加载
+
+### ----- Model ----- ###
+MODEL:
+  SKELETON: PointPillar_RLF        # 主体模型框架：PointPillar，RLF为定制/变体
+
+  PRE_PROCESSING:                  # 点云预处理相关
+    VER: 'v1_0'                    # 预处理版本
+    INPUT_DIM: 4  # 子网络的输入特征维度
+    SHUFFLE_POINTS: True           # 是否打乱点顺序
+    TRANSFORM_POINTS_TO_VOXELS: True # 是否将点云转为体素
+    MAX_POINTS_PER_VOXEL: 32       # 每个体素最多含多少点
+    DENOISE_T: 0.3                 # 去噪阈值
+    DYNAMIC_DENOISE: False
+    DYNAMIC_DENOISE_CKPT: 'models/shared_thr_heads.pth'
+    WEATHER_MAP_PATH: 'tmp/frame_features/weather_map.json'  # optional
+    DYNAMIC_THR_ALPHA: 0.9
+    DYNAMIC_THR_DEFAULT: 0.3
+    MOTION_COMPENSATION: 
+        ENABLED: True 
+        ADD_TO_POINT_FEATURES: True   # append temporal_score to point_features
+        FEAT_DIM: 1         # temporal feature dim (1)
+        NUM_HISTORY: 2
+        MAX_PREV_POINTS: 5000 
+        USE_CKDTREE: True 
+        DIST_TOL: 0.5 
+        MIN_PERSIST: 1 
+        USE_EGO_POSE: True 
+        USE_DOPPLER: True 
+        DOPPLER_SCALE: 1.0 
+        XYZ_SLICE: [1,4] 
+        DOPPLER_IDX: 4 
+        POWER_IDX: 3
+    PREFILTER:
+        POINT_SCORE_TH: 0.2
+        TOPK_PER_BATCH: 2000
+    MAX_NUMBER_OF_VOXELS: {
+      'train': 16000,              # 训练时最大体素数 16000
+      'test': 40000                # 测试时最大体素数
+    }
+
+  VFE:                             # Voxel Feature Encoder
+    NAME: BiDF_PillarVFE           # VFE类型
+    #RAW_INPUT_DIM: 5  # 输入特征维度，扩展为5
+    WITH_DISTANCE: False           # 是否包含距离特征
+    USE_ABSLOTE_XYZ: True          # 是否用绝对坐标
+    USE_NORM: True                 # 是否归一化
+    USE_RadarSCORE: True           # 是否用雷达置信度
+    NUM_FILTERS: [64]              # 特征通道数
+    NUM_FILTERS_Radar: [64]        # 雷达特征通道数
+
+  BACKBONE_3D:                     # 3D骨干网络
+    NAME: PointNet2MSG             # 使用PointNet++ multi-scale grouping
+    SA_CONFIG:                     # 采样和聚合配置
+        USE_RAWDIM : 5             # 输入特征维度
+        NPOINTS: [4096, 1024, 256, 64] # 层级点数
+        RADIUS: [[0.1, 0.5], [0.5, 1.0], [1.0, 2.0], [2.0, 4.0]] # 多尺度半径
+        NSAMPLE: [[16, 32], [16, 32], [16, 32], [16, 32]]        # 每层采样数
+        MLPS: [[[16, 16, 32], [32, 32, 64]],
+                [[64, 64, 128], [64, 96, 128]],
+                [[128, 196, 256], [128, 196, 256]],
+                [[256, 256, 512], [256, 384, 512]]]              # MLP配置
+    FP_MLPS: [[128, 128], [256, 256], [512, 512], [512, 512]]    # 反向传播MLP
+
+  MAP_TO_BEV: 
+    NAME: PointPillarScatter       # BEV映射方式
+    NUM_BEV_FEATURES: [64,64]      # BEV特征数量
+
+  POINT_HEAD:
+    NAME: PointHeadPreMask         # 点云头部结构
+    CLS_FC: [256, 256]             # 分类全连接层
+    CLASS_AGNOSTIC: False          # 是否类别无关
+    USE_POINT_FEATURES_BEFORE_FUSION: False # 融合前是否用点特征
+    DOPPLER_FUSION:
+        ENABLED: True              # 启用 doppler 功能
+        ADD_TO_POINT_FEATURES: False  # 是否把 doppler 衍生特征 concat 到 point_features（可选）
+        SCORE_FUSION: True         # 是否做 score-level 融合（必需打开才能运行下面 fusion）
+        FUSION_MODE: "mlp"  # one of ["learnable_alpha", "mlp", "fixed"]
+        DOP_FEAT_DIM: 6            # doppler 衍生特征维度（fallback为6）
+        FIXED_ALPHA: 0.5           # 若 FUSION_MODE=fixed, 使用这个 alpha
+        METHOD: 'logit_sum'  # ['logit_sum', 'weighted', 'mul']
+        BETA: 1.0             # used for 'logit_sum' strength
+        WEIGHTED_ALPHA: 0.6   # used when METHOD == 'weighted'
+        # MLP-specific hyperparams (new)
+        MLP_HIDDEN: 16                # hidden dim for score_fuser
+        MLP_DROPOUT: 0.1              # dropout probability in score_fuser
+        PDOP_PARAMS: {
+            'w_power': 0.8,
+            'w_motion': 1.0,
+            'w_consistency': 0.6,
+            'power_thresh_keep_static': 0.7,
+            'beta': 6.0,
+            'bias': -0.2
+        }
+        
+    TARGET_CONFIG:                 # 目标编码相关
+        GT_EXTRA_WIDTH: [0.2, 0.2, 0.2]    # GT框扩展
+        BOX_CODER: PointResidualCoder      # 框编码方式
+        BOX_CODER_CONFIG: {
+            'use_mean_size': True,         # 是否使用均值尺寸
+            'mean_size': [
+                [3.9, 1.6, 1.56],         # 车辆
+                [0.8, 0.6, 1.73],         # 行人等
+                [1.76, 0.6, 1.73]
+            ]
+        }
+
+    LOSS_CONFIG:                          # 损失配置
+        LOSS_REG: WeightedSmoothL1Loss    # 回归损失
+        LOSS_WEIGHTS: {
+            'point_cls_weight': 2.0,      # 分类损失权重
+            'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # 回归各项权重
+        }
+        
+
+
+  BACKBONE_2D:
+    NAME: BaseBEVBackbone_MF              # 2D骨干网络
+    LAYER_NUMS: [3, 5, 5]                 # 每层卷积次数
+    LAYER_STRIDES: [2, 2, 2]              # 每层步幅
+    NUM_FILTERS: [128, 256, 512]          # 每层输出通道
+    UPSAMPLE_STRIDES: [1, 2, 4]           # 上采样步幅
+    NUM_UPSAMPLE_FILTERS: [128, 128, 128] # 上采样通道数
+
+  DENSE_HEAD:
+    NAME: AnchorHeadSingle                # 稠密检测头
+    CLASS_AGNOSTIC: False                 # 是否类别无关
+    CLASS_NAMES_EACH_HEAD: [              # 每个head检测的类别（注释掉，实际只检测Sedan）
+      # [ 'Sedan', 'Bus or Truck' ]
+    ]
+    USE_DIRECTION_CLASSIFIER: True        # 是否用方向分类
+    DIR_OFFSET: 0.78539                   # 方向偏移
+    DIR_LIMIT_OFFSET: 0.0                 # 方向限制偏移
+    NUM_DIR_BINS: 2                       # 方向分类bins
+
+    ANCHOR_GENERATOR_CONFIG: [            # Anchor生成配置
+      {
+          'class_name': 'Sedan',          # 仅检测Sedan
+          'anchor_sizes': [[4.2, 2.1, 2.0]], # anchor尺寸
+          'anchor_rotations': [0, 1.57],  # anchor旋转角（弧度）
+          'anchor_bottom_heights': [-1.08], # anchor底部高度
+          'align_center': False,           # 是否中心对齐
+          'feature_map_stride': 2,         # 特征图步幅
+          'matched_threshold': 0.6,        # 匹配阈值
+          'unmatched_threshold': 0.45      # 非匹配阈值
+      },
+    ]
+
+    TARGET_ASSIGNER_CONFIG:               # 目标分配器
+      NAME: AxisAlignedTargetAssigner     # 轴对齐分配
+      POS_FRACTION: -1.0                  # 正样本比例
+      SAMPLE_SIZE: 512                    # 采样数
+      NORM_BY_NUM_EXAMPLES: False         # 是否按样本归一化
+      MATCH_HEIGHT: False                 # 是否考虑高度匹配
+      BOX_CODER: ResidualCoder            # 框编码方式
+
+    LOSS_CONFIG:
+      LOSS_WEIGHTS: {
+        'cls_weight': 1.0,                # 分类损失权重
+        'loc_weight': 2.0,                # 定位损失权重
+        'dir_weight': 0.2,                # 方向损失权重
+        'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # 回归分量权重
+      }
+
+    POST_PROCESSING:                      # 后处理参数
+      RECALL_THRESH_LIST: [0.3, 0.5, 0.7] # 召回率阈值
+      SCORE_THRESH: 0.1                   # 分数阈值
+      OUTPUT_RAW_SCORE: False             # 是否输出原始分数
+      EVAL_METRIC: kitti                  # 评估指标
+      NMS_CONFIG:                         # NMS配置
+        MULTI_CLASSES_NMS: False          # 是否多类NMS
+        NMS_TYPE: nms_gpu                 # NMS类型
+        NMS_THRESH: 0.01                  # NMS阈值
+        NMS_PRE_MAXSIZE: 4096             # NMS前保留最大框数
+        NMS_POST_MAXSIZE: 500             # NMS后保留最大框数
+
+  POST_PROCESSING:                        # 全局后处理参数
+    RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+    SCORE_THRESH: 0.1
+    OUTPUT_RAW_SCORE: False
+    EVAL_METRIC: kitti
+    NMS_CONFIG:
+      MULTI_CLASSES_NMS: False
+      NMS_TYPE: nms_gpu
+      NMS_THRESH: 0.7
+      NMS_PRE_MAXSIZE: 4096
+      NMS_POST_MAXSIZE: 500
+### ----- Model ----- ###
+
+### ----- Optimizer ----- ###
+get_loss_from: 'detector'                  # 获取损失的模块
+OPTIMIZER: # Training
+  NAME: 'AdamW'                            # 优化器类型
+  LR: 0.001                                # 初始学习率
+  MIN_LR: 0.0001                           # 最小学习率
+  BETAS: [0.9, 0.999]                      # Adam参数
+  WEIGHT_DECAY: 0.01                       # 权重衰减
+  MOMENTUM: 0.9                            # 动量（如SGD时用）
+  BATCH_SIZE: 4                            # 批量大小
+  NUM_WORKERS: 0                          # dataloader进程数 16
+  MAX_EPOCH: 35                            # 最大训练轮数
+  SCHEDULER: 'CosineAnnealingLR'           # 学习率调度器
+  TYPE_TOTAL_ITER: 'every'                 # 学习率更新模式（每epoch更新）
+### ----- Optimizer ----- ###
+
+### ----- Validation ----- ###
+cfg_eval_ver2: True                        # 是否用新版评估方式
+VAL:
+  IS_VALIDATE: False                       # 是否开启验证
+  IS_CONSIDER_VAL_SUBSET: True             # 是否只验证子集
+  VAL_PER_EPOCH_SUBSET: 1                  # 每多少epoch验证一次子集
+  NUM_SUBSET: 500                          # 子集帧数
+  VAL_PER_EPOCH_FULL: 11                   # 每多少epoch验证一次全量数据
+  LIST_VAL_CONF_THR: [0.3, 0.5, 0.7]       # 验证用置信度阈值
+  LIST_VAL_IOU: [0.7, 0.5, 0.3]            # 验证用IoU阈值
+  # This is for logging, change the iou threshold in 'utils/kitti_eval'
+  CLASS_VAL_KEYWORD: {
+    'Sedan': 'sed',                        # 验证类名与关键字映射
+    'Bus or Truck': 'bus',
+    'Motorcycle': 'mot',
+    'Bicycle': 'bic',
+    'Bicycle Group': 'big',
+    'Pedestrian': 'ped',
+    'Pedestrian Group': 'peg'
+  }
+  REGARDING: 'anchor'                      # 验证对象类型
+  LIST_CARE_VAL: ['Sedan']                 # 验证关注类别
+### ----- Validation ----- ###
+
+### ----- Visualization ----- ###
+VIS:
+  # OpenCV 配色
+  CLASS_BGR: {
+    'Sedan': [0,255,0],
+    'Bus or Truck': [0,50,255],
+    'Motorcycle': [0,0,255],
+    'Bicycle': [0,255,255],
+    'Pedestrian': [255,0,0],
+    'Pedestrian Group': [255,0,100],
+    'Label': [128,128,128]
+  }
+
+  # Open3D 配色
+  CLASS_RGB: {
+    'Sedan': [0, 1, 0],
+    'Bus or Truck': [1, 0.2, 0],
+    'Motorcycle': [1, 0, 0],
+    'Bicycle': [1, 1, 0],
+    'Pedestrian': [0, 0, 1],
+    'Pedestrian Group': [0.4, 0, 1],
+    'Label': [0.5, 0.5, 0.5]
+  }
+  
+  ROI:
+    TYPE: 'default'                         # ROI类型
+    DEFAULT: [0,100,-40,40,-10,60]          # 默认空间范围
+
+  # BEV可视化参数
+  Z_CENTER: {
+    'Sedan': 0.5,
+    'Bus or Truck': 1.5,
+    'Motorcycle': 0.5,
+    'Bicycle': 0.5,
+    'Pedestrian': 0.5,
+    'Pedestrian Group': 0.5,
+  }
+
+  Z_HEIGHT: {
+    'Sedan': 1.9,
+    'Bus or Truck': 1.9,
+    'Motorcycle': -1,
+    'Bicycle': -1,
+    'Pedestrian': 2,
+    'Pedestrian Group': -1,
+  }
+### ----- Visualization ----- ###
