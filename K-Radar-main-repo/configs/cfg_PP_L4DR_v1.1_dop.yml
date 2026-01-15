@@ -130,6 +130,11 @@ MODEL:
         XYZ_SLICE: [1,4] 
         DOPPLER_IDX: 4 
         POWER_IDX: 3
+        DEFAULT_DT: 0.1                 # 当前帧与前一帧的时间间隔（fallback）
+        USE_MEDIAN_DT: true             # 是否使用序列的 median dt
+        USE_SOFT_MATCH: true            # 是否启用 soft matching（建议 true）
+        SOFT_WEIGHT: 0.3                # soft 分数权重（0=退化为纯硬匹配）
+        SOFT_DOPPLER_SIGMA: 1.0          # Doppler 相似性尺度 (m/s)
     PREFILTER:
         POINT_SCORE_TH: 0.2
         TOPK_PER_BATCH: 2000
