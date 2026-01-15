@@ -117,6 +117,7 @@ MODEL:
     DYNAMIC_THR_DEFAULT: 0.3
     MOTION_COMPENSATION: 
         ENABLED: True 
+        RDR_INDEX_WIDTH: 5
         ADD_TO_POINT_FEATURES: True   # append temporal_score to point_features
         FEAT_DIM: 1         # temporal feature dim (1)
         NUM_HISTORY: 2
@@ -136,7 +137,7 @@ MODEL:
         SOFT_WEIGHT: 0.3                # soft 分数权重（0=退化为纯硬匹配）
         SOFT_DOPPLER_SIGMA: 1.0          # Doppler 相似性尺度 (m/s)
     PREFILTER:
-        POINT_SCORE_TH: 0.2
+        POINT_SCORE_TH: 0.25
         TOPK_PER_BATCH: 2000
     MAX_NUMBER_OF_VOXELS: {
       'train': 16000,              # 训练时最大体素数 16000
@@ -300,8 +301,8 @@ OPTIMIZER: # Training
   BETAS: [0.9, 0.999]                      # Adam参数
   WEIGHT_DECAY: 0.01                       # 权重衰减
   MOMENTUM: 0.9                            # 动量（如SGD时用）
-  BATCH_SIZE: 4                            # 批量大小
-  NUM_WORKERS: 0                          # dataloader进程数 16
+  BATCH_SIZE: 4                            # 批量大小 4
+  NUM_WORKERS: 4                          # dataloader进程数 16
   MAX_EPOCH: 35                            # 最大训练轮数
   SCHEDULER: 'CosineAnnealingLR'           # 学习率调度器
   TYPE_TOTAL_ITER: 'every'                 # 学习率更新模式（每epoch更新）
