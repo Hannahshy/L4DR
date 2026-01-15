@@ -34,13 +34,23 @@ class TemporalMotionCompensator:
         self._use_cKDTree_prefer = bool(mcfg.get('USE_CKDTREE', True))
         # debug flag
         self.debug = bool(mcfg.get('DEBUG', False))
-        # ---- dataset / io related (NEW) ----
-        self.rdr_sparse_dir = mcfg.get('RDR_SPARSE_DIR', None)   # e.g. cfg.rdr_sparse.dir
-        self.rdr_file_prefix = mcfg.get('RDR_FILE_PREFIX', 'rdr_sparse_doppler_')
-        self.rdr_file_ext = mcfg.get('RDR_FILE_EXT', '.npy')
+        # ---- dataset / io related (align with cfg.rdr_sparse) ----
+        self.rdr_sparse_dir = None
+        self.rdr_file_prefix = 'rdr_sparse_doppler_'
+        self.rdr_file_ext = '.npy'
+        self.n_used = 5
+        
+        if cfg is not None and hasattr(cfg, 'rdr_sparse'):
+            try:
+                rdr_cfg = cfg.rdr_sparse
+                self.rdr_sparse_dir = rdr_cfg.get('dir', None)
+                self.n_used = int(rdr_cfg.get('n_used', self.n_used))
+                # 对齐 doppler / power index
+                self.dop_idx = int(rdr_cfg.get('doppler_idx', self.dop_idx))
+                self.power_idx = int(rdr_cfg.get('power_idx', self.power_idx))
+            except Exception:
+                pass
 
-        # feature dimension (fallback only)
-        self.n_used = int(mcfg.get('N_USED', 5))
         # history indexing
         self.require_meta_idx = True   # assert meta contains rdr_idx_int
         # ---- Patch 1: temporal dt handling ----
@@ -131,8 +141,8 @@ class TemporalMotionCompensator:
 
     def _load_prev_radar(self, seq, curr_idx_int, k_hist):
         """
-        Load k-th previous radar frame for a single sample.
-        Returns np.ndarray (N, C) or None.
+        Load k-th previous radar frame using mmap (RAM-safe).
+        Returns np.ndarray view or None.
         """
         if self.rdr_sparse_dir is None:
             return None
@@ -143,7 +153,7 @@ class TemporalMotionCompensator:
         if prev_idx < 0:
             return None
     
-        # zero-pad width: assume same width as current idx
+        # keep same zero-padding width as current index
         curr_str = str(curr_idx_int)
         width = len(curr_str)
         prev_str = str(prev_idx).zfill(width)
@@ -154,16 +164,17 @@ class TemporalMotionCompensator:
             f'{self.rdr_file_prefix}{prev_str}{self.rdr_file_ext}'
         )
     
-        if not os.path.exists(path):
+        if not os.path.isfile(path):
             return None
     
         try:
-            arr = np.load(path, mmap_mode='r')  # ★关键：mmap 防 RAM 爆炸
-            if arr.ndim != 2 or arr.shape[0] == 0:
+            arr = np.load(path, mmap_mode='r')   # ★ mmap 不进 RAM
+            if arr.ndim != 2 or arr.shape[1] < self.n_used:
                 return None
             return arr
         except Exception:
             return None
+
 
 
     def _compute_match_counts(self, batch_dict, candidate_mask=None):
