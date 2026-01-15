@@ -301,11 +301,13 @@ class PointPillar_RLF(nn.Module):
             except Exception:
                 motion_cfg = None
 
-        if motion_cfg is not None and isinstance(motion_cfg, dict):
+        if motion_cfg is not None and (hasattr(motion_cfg, 'get') or isinstance(motion_cfg, dict)):
             self._add_temporal_to_point_features = bool(motion_cfg.get('ADD_TO_POINT_FEATURES', False))
             self._temporal_feat_dim = int(motion_cfg.get('FEAT_DIM', 1))
         else:
+            self._add_temporal_to_point_features = False
             self._temporal_feat_dim = 1
+
 
         # Build VFE
         self.vfe = vfe.__all__[self.model_cfg.VFE.NAME](
@@ -400,7 +402,7 @@ class PointPillar_RLF(nn.Module):
                 motion_cfg = cfg.MODEL.PRE_PROCESSING.MOTION_COMPENSATION
             except Exception:
                 motion_cfg = getattr(cfg.MODEL.PRE_PROCESSING, 'MOTION_COMPENSATION', None)
-            self.temporal_comp = TemporalMotionCompensator(motion_cfg)
+            self.temporal_comp = TemporalMotionCompensator(cfg)
             print("* TemporalMotionCompensator instantiated (enabled=%s)" % self.temporal_comp.enabled)
         except Exception as e:
             print(f"* Warning: failed to instantiate TemporalMotionCompensator: {e}")
@@ -918,7 +920,7 @@ class PointPillar_RLF(nn.Module):
         # ---------- end candidate-based temporal matching ----------
             
         # run point head
-        batch_dict = self.point_head(batch_dict)
+        #batch_dict = self.point_head(batch_dict)
 
         # compute s_point
         s_point_raw = batch_dict['point_cls_scores']
