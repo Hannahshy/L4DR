@@ -2,68 +2,89 @@
 # Simple temporal motion compensation + persistence filter for radar sparse points
 # See assistant notes for usage and expected batch_dict keys.
 import torch
+import os
 import numpy as np
 
 class TemporalMotionCompensator:
     def __init__(self, cfg=None):
         # cfg may be EasyDict or dict or None
         mcfg = {}
-        if cfg is not None:
+        full_cfg = None
+        if cfg is None:
+            mcfg = {}
+        else:
+            # If user passed the full cfg, extract motion sub-dict and remember full_cfg
             try:
-                mcfg = cfg.MOTION_COMPENSATION if hasattr(cfg, 'MOTION_COMPENSATION') else cfg.get('MOTION_COMPENSATION', {})
+                if hasattr(cfg, 'MODEL') and hasattr(cfg.MODEL, 'PRE_PROCESSING'):
+                    full_cfg = cfg
+                    try:
+                        mcfg = cfg.MODEL.PRE_PROCESSING.MOTION_COMPENSATION
+                    except Exception:
+                        mcfg = cfg.MODEL.PRE_PROCESSING.get('MOTION_COMPENSATION', {})
+                elif isinstance(cfg, dict) and 'MODEL' in cfg and 'PRE_PROCESSING' in cfg['MODEL']:
+                    full_cfg = cfg
+                    mcfg = cfg['MODEL']['PRE_PROCESSING'].get('MOTION_COMPENSATION', {})
+                else:
+                    # assume cfg is already the motion sub-dict
+                    if isinstance(cfg, dict) or hasattr(cfg, 'get'):
+                        mcfg = cfg
+                    else:
+                        # fallback
+                        mcfg = {}
             except Exception:
-                try:
-                    mcfg = cfg.get('MOTION_COMPENSATION', {})
-                except Exception:
-                    mcfg = {}
+                mcfg = {}
         self.enabled = bool(mcfg.get('ENABLED', True))
         self.num_history = int(mcfg.get('NUM_HISTORY', 3))
-        self.dist_tol = float(mcfg.get('DIST_TOL', 0.5))         # meters for NN match
-        self.min_persist = int(mcfg.get('MIN_PERSIST', 1))       # require matches in >= this many histories
+        self.dist_tol = float(mcfg.get('DIST_TOL', 0.5))
+        self.min_persist = int(mcfg.get('MIN_PERSIST', 1))
         self.use_ego = bool(mcfg.get('USE_EGO_POSE', True))
         self.use_doppler = bool(mcfg.get('USE_DOPPLER', True))
         self.doppler_scale = float(mcfg.get('DOPPLER_SCALE', 1.0))
-        # default slices (assume first col possibly batch idx): [start, end) python indexing
         self.xyz_slice = tuple(mcfg.get('XYZ_SLICE', (1,4)))
         self.dop_idx = int(mcfg.get('DOPPLER_IDX', 4))
         self.power_idx = int(mcfg.get('POWER_IDX', 3))
-        # inside __init__ (after existing self.* assignments)
-        # optional maximum prev points to use per history (to limit KDTree work)
         self.max_prev_points = int(mcfg.get('MAX_PREV_POINTS', 5000))
-        # prefer scipy cKDTree if available (fallback to torch.cdist if not)
         self._use_cKDTree_prefer = bool(mcfg.get('USE_CKDTREE', True))
-        # debug flag
         self.debug = bool(mcfg.get('DEBUG', False))
-        # ---- dataset / io related (align with cfg.rdr_sparse) ----
+
+        # dt / fallback behaviour
+        self.default_dt = float(mcfg.get('DEFAULT_DT', mcfg.get('default_dt', 0.1)))
+        self.use_median_dt = bool(mcfg.get('USE_MEDIAN_DT', True))
+
+        # soft matching params
+        self.use_soft = bool(mcfg.get('USE_SOFT_MATCH', True))
+        self.soft_doppler_sigma = float(mcfg.get('SOFT_DOPPLER_SIGMA', 1.0))
+        self.soft_weight = float(mcfg.get('SOFT_WEIGHT', 0.5))
+
+        # dataset-level defaults (may be filled from full_cfg)
         self.rdr_sparse_dir = None
-        self.rdr_file_prefix = 'rdr_sparse_doppler_'
-        self.rdr_file_ext = '.npy'
-        self.n_used = 5
-        
-        if cfg is not None and hasattr(cfg, 'rdr_sparse'):
+        self.rdr_file_prefix = mcfg.get('RDR_FILE_PREFIX', 'rdr_sparse_doppler_')
+        self.rdr_file_ext = mcfg.get('RDR_FILE_EXT', '.npy')
+        self.n_used = int(mcfg.get('N_USED', 5))
+
+        # if a full cfg was provided, try to read DATASET.rdr_sparse info
+        if full_cfg is not None:
             try:
-                rdr_cfg = cfg.rdr_sparse
-                self.rdr_sparse_dir = rdr_cfg.get('dir', None)
+                try:
+                    rdr_cfg = full_cfg.DATASET.rdr_sparse
+                except Exception:
+                    rdr_cfg = full_cfg.get('DATASET', {}).get('rdr_sparse', {})
+                self.rdr_sparse_dir = rdr_cfg.get('dir', self.rdr_sparse_dir)
                 self.n_used = int(rdr_cfg.get('n_used', self.n_used))
-                # 对齐 doppler / power index
                 self.dop_idx = int(rdr_cfg.get('doppler_idx', self.dop_idx))
                 self.power_idx = int(rdr_cfg.get('power_idx', self.power_idx))
             except Exception:
                 pass
 
-        # history indexing
-        self.require_meta_idx = True   # assert meta contains rdr_idx_int
-        # ---- Patch 1: temporal dt handling ----
-        self.default_dt = float(mcfg.get('DEFAULT_DT', 0.1))   # fallback
-        self.seq_median_dt = {}   # {seq_id: median_dt}
-        self.use_median_dt = bool(mcfg.get('USE_MEDIAN_DT', True))
-        # ---- Patch 2: soft matching ----
-        self.use_soft = bool(mcfg.get('USE_SOFT_MATCH', True))
-        self.soft_doppler_sigma = float(mcfg.get('SOFT_DOPPLER_SIGMA', 1.0))  # m/s
-        self.soft_weight = float(mcfg.get('SOFT_WEIGHT', 0.5))               # [0,1]
+        # allow motion config to override rdr dir
+        rd = mcfg.get('RDR_SPARSE_DIR', None)
+        if rd:
+            self.rdr_sparse_dir = rd
 
-
-
+        self.rdr_index_width = int(mcfg.get('RDR_INDEX_WIDTH', 5))
+        # seq median dt map; dataset may populate this after instantiation
+        self.seq_median_dt = {}
+        self.require_meta_idx = bool(mcfg.get('REQUIRE_META_IDX', True))
 
 
     @staticmethod
@@ -141,21 +162,19 @@ class TemporalMotionCompensator:
 
     def _load_prev_radar(self, seq, curr_idx_int, k_hist):
         """
-        Load k-th previous radar frame using mmap (RAM-safe).
-        Returns np.ndarray view or None.
+        Load k-th previous radar frame for a single sample using mmap.
+        File index is zero-padded with fixed width (default 5).
         """
         if self.rdr_sparse_dir is None:
             return None
         if curr_idx_int is None:
             return None
     
-        prev_idx = curr_idx_int - k_hist
+        prev_idx = int(curr_idx_int) - int(k_hist)
         if prev_idx < 0:
             return None
     
-        # keep same zero-padding width as current index
-        curr_str = str(curr_idx_int)
-        width = len(curr_str)
+        width = int(self.rdr_index_width) if self.rdr_index_width is not None else len(str(curr_idx_int))
         prev_str = str(prev_idx).zfill(width)
     
         path = os.path.join(
@@ -168,8 +187,8 @@ class TemporalMotionCompensator:
             return None
     
         try:
-            arr = np.load(path, mmap_mode='r')   # ★ mmap 不进 RAM
-            if arr.ndim != 2 or arr.shape[1] < self.n_used:
+            arr = np.load(path, mmap_mode='r')
+            if arr.ndim != 2 or arr.shape[0] == 0:
                 return None
             return arr
         except Exception:
@@ -268,19 +287,25 @@ class TemporalMotionCompensator:
                     except Exception:
                         pass
     
-                # ---- doppler compensation (rough)
+                # ---- doppler compensation (显示的对历史建模，用真实时间戳隐式)
                 if self.use_doppler and prev_np.shape[1] > self.dop_idx:
                     try:
                         if cur_ts is not None:
-                            dt = self.default_dt * k
-                            dop = prev_np[:, self.dop_idx].astype(np.float32)
+                            # choose dt source
+                            if self.use_median_dt:
+                                md = self.seq_median_dt.get(str(seq), None)
+                            else:
+                                md = None
+                            base_dt = float(md) if (md is not None) else float(self.default_dt)
+                            dt = base_dt * float(k)
+                
+                            dop = np.asarray(prev_np[:, self.dop_idx], dtype=np.float32)
                             norms = np.linalg.norm(prev_xyz, axis=1, keepdims=True)
                             norms = np.clip(norms, 1e-6, None)
-                            prev_xyz += (dop[:, None] * dt * self.doppler_scale) * (
-                                prev_xyz / norms
-                            )
+                            prev_xyz += (dop[:, None] * dt * float(self.doppler_scale)) * (prev_xyz / norms)
                     except Exception:
                         pass
+
     
                 # ---- downsample
                 if self.max_prev_points > 0 and prev_xyz.shape[0] > self.max_prev_points:
@@ -320,7 +345,7 @@ class TemporalMotionCompensator:
                     else:
                         combined = hard_hit
     
-                    local_score += torch.from_numpy(combined).to(device)
+                    local_score += torch.from_numpy(combined).to(device=device, dtype=torch.float32)
     
                 except Exception:
                     pass
