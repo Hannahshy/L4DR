@@ -34,6 +34,27 @@ class TemporalMotionCompensator:
         self._use_cKDTree_prefer = bool(mcfg.get('USE_CKDTREE', True))
         # debug flag
         self.debug = bool(mcfg.get('DEBUG', False))
+        # ---- dataset / io related (NEW) ----
+        self.rdr_sparse_dir = mcfg.get('RDR_SPARSE_DIR', None)   # e.g. cfg.rdr_sparse.dir
+        self.rdr_file_prefix = mcfg.get('RDR_FILE_PREFIX', 'rdr_sparse_doppler_')
+        self.rdr_file_ext = mcfg.get('RDR_FILE_EXT', '.npy')
+
+        # feature dimension (fallback only)
+        self.n_used = int(mcfg.get('N_USED', 5))
+        # history indexing
+        self.require_meta_idx = True   # assert meta contains rdr_idx_int
+        # ---- Patch 1: temporal dt handling ----
+        self.default_dt = float(mcfg.get('DEFAULT_DT', 0.1))   # fallback
+        self.seq_median_dt = {}   # {seq_id: median_dt}
+        self.use_median_dt = bool(mcfg.get('USE_MEDIAN_DT', True))
+        # ---- Patch 2: soft matching ----
+        self.use_soft = bool(mcfg.get('USE_SOFT_MATCH', True))
+        self.soft_doppler_sigma = float(mcfg.get('SOFT_DOPPLER_SIGMA', 1.0))  # m/s
+        self.soft_weight = float(mcfg.get('SOFT_WEIGHT', 0.5))               # [0,1]
+
+
+
+
 
     @staticmethod
     def _ensure_tensor(x, device=None, dtype=torch.float32):
@@ -108,271 +129,201 @@ class TemporalMotionCompensator:
         except Exception:
             return None
 
-# (替换或插入到 TemporalMotionCompensator 类中，替换原有 _compute_match_counts 和 get_temporal_scores)
+    def _load_prev_radar(self, seq, curr_idx_int, k_hist):
+        """
+        Load k-th previous radar frame for a single sample.
+        Returns np.ndarray (N, C) or None.
+        """
+        if self.rdr_sparse_dir is None:
+            return None
+        if curr_idx_int is None:
+            return None
+    
+        prev_idx = curr_idx_int - k_hist
+        if prev_idx < 0:
+            return None
+    
+        # zero-pad width: assume same width as current idx
+        curr_str = str(curr_idx_int)
+        width = len(curr_str)
+        prev_str = str(prev_idx).zfill(width)
+    
+        path = os.path.join(
+            self.rdr_sparse_dir,
+            str(seq),
+            f'{self.rdr_file_prefix}{prev_str}{self.rdr_file_ext}'
+        )
+    
+        if not os.path.exists(path):
+            return None
+    
+        try:
+            arr = np.load(path, mmap_mode='r')  # ★关键：mmap 防 RAM 爆炸
+            if arr.ndim != 2 or arr.shape[0] == 0:
+                return None
+            return arr
+        except Exception:
+            return None
+
+
     def _compute_match_counts(self, batch_dict, candidate_mask=None):
         """
-        Compute match_counts for current points. If candidate_mask is provided (boolean Tensor
-        of length N on same device as batch_dict['rdr_sparse']), only compute matches for
-        the candidate subset to save memory/time. Returns (match_counts_all, denom).
+        Hard + Soft (Doppler-aware) temporal match counting.
+        RAM-safe, mmap-based, KDTree local search.
         """
-        # If not enabled or missing data, return zeros as before
-        cache = batch_dict.setdefault('_tmc_cache', {})
-        key = id(self)
-
-        # If no rdr data, quick exit
-        if (not self.enabled) or ('rdr_sparse' not in batch_dict) or ('batch_indices_rdr_sparse' not in batch_dict):
-            N = batch_dict['rdr_sparse'].shape[0] if 'rdr_sparse' in batch_dict else 0
-            match_counts_all = torch.zeros((N,), dtype=torch.int32, device=batch_dict['rdr_sparse'].device if 'rdr_sparse' in batch_dict else 'cpu')
-            denom = 1.0
-            # When candidates were provided, avoid caching to keep semantics simple
-            if candidate_mask is None:
-                cache[key] = {'match_counts': match_counts_all, 'denom': denom}
-            return match_counts_all, denom
-
-        # If candidate_mask not provided and cache exists, return cache
-        if candidate_mask is None and key in cache:
-            return cache[key]['match_counts'], cache[key]['denom']
-
-        # Otherwise, compute (candidate-aware)
+        if (not self.enabled) or ('rdr_sparse' not in batch_dict):
+            N = batch_dict['rdr_sparse'].shape[0]
+            return torch.zeros((N,), dtype=torch.int32,
+                               device=batch_dict['rdr_sparse'].device), 1.0
+    
         device = batch_dict['rdr_sparse'].device
-        curr_pts_all = batch_dict['rdr_sparse']
-        batch_idxs = batch_dict['batch_indices_rdr_sparse'].long().to(device)
-
-        prev_rdrs = batch_dict.get('prev_rdrs', None)
-        prev_batch_inds = batch_dict.get('prev_batch_indices', None)
-        prev_timestamps = batch_dict.get('prev_timestamps', None)
-        prev_poses = batch_dict.get('prev_poses', None)
-        curr_timestamps = batch_dict.get('timestamp', None) or batch_dict.get('timestamps', None)
-        curr_poses = batch_dict.get('poses', None)
-
-        N = curr_pts_all.shape[0]
-        match_counts_all = torch.zeros((N,), dtype=torch.int32, device=device)
-
-        if (not prev_rdrs) or len(prev_rdrs) == 0:
-            denom = 1.0
-            # don't cache when candidate_mask provided
-            if candidate_mask is None:
-                cache[key] = {'match_counts': match_counts_all, 'denom': denom}
-            return match_counts_all, denom
-
+        curr_pts = batch_dict['rdr_sparse']
+        batch_idxs = batch_dict['batch_indices_rdr_sparse'].long()
+    
+        metas = batch_dict['meta']
+        N = curr_pts.shape[0]
+        match_counts_all = torch.zeros((N,), dtype=torch.float32, device=device)
+    
         start, end = self.xyz_slice
         B = int(batch_dict.get('batch_size', 1))
-
-        # prefer cKDTree if available
-        use_ckd = False
-        if self._use_cKDTree_prefer:
-            try:
-                from scipy.spatial import cKDTree
-                use_ckd = True
-            except Exception:
-                use_ckd = False
-
-        # helper to downsample prev points
-        def _maybe_downsample(prev_arr_np):
-            M = prev_arr_np.shape[0]
-            if M > self.max_prev_points and self.max_prev_points > 0:
-                idx = np.random.choice(M, self.max_prev_points, replace=False)
-                return prev_arr_np[idx]
-            else:
-                return prev_arr_np
-
-        CHUNK = 8192
-
-        # candidate_mask: convert to CPU bool numpy if provided
+    
+        # ---- candidate mask (CPU once)
         if candidate_mask is not None:
-            # ensure boolean tensor on same device
-            if not torch.is_tensor(candidate_mask):
-                raise ValueError("candidate_mask must be a torch.BoolTensor or None")
-            # move to CPU numpy bool array for indexing
-            candidate_mask_cpu = candidate_mask.detach().cpu().numpy().astype(bool)
+            cand_np = candidate_mask.detach().cpu().numpy().astype(np.bool_)
         else:
-            candidate_mask_cpu = None
-
-        for b in range(B):
-            # global indices in curr_pts_all for this batch
-            mask_idxs = (batch_idxs == b).cpu().numpy()
-            if candidate_mask_cpu is not None:
-                # only keep those that are both in this batch and marked candidate
-                mask_idxs = mask_idxs & candidate_mask_cpu
-            # get positions (global indices) of candidates in this batch
-            idx_positions = np.nonzero(mask_idxs)[0]
-            if idx_positions.size == 0:
-                continue
-
-            # Build curr_xyz for candidates only
-            curr_xyz = curr_pts_all[idx_positions, start:end].to(device)
-            # match_counts local
-            match_counts = torch.zeros((curr_xyz.shape[0],), dtype=torch.int32, device=device)
-            cur_ts = self._safe_get_ts(curr_timestamps, b)
-
-            for k, prev in enumerate(prev_rdrs[: self.num_history]):
-                if prev is None:
-                    continue
-
-                # convert prev to numpy safely
-                try:
-                    if torch.is_tensor(prev):
-                        prev_np_all = prev.cpu().numpy()
-                    else:
-                        prev_np_all = np.array(prev)
-                except Exception:
-                    try:
-                        prev_np_all = np.asarray(prev)
-                    except Exception:
-                        continue
-
-                if prev_np_all.size == 0:
-                    continue
-
-                # filter prev by batch index if provided
-                if prev_batch_inds and k < len(prev_batch_inds) and prev_batch_inds[k] is not None:
-                    pbi = prev_batch_inds[k]
-                    if torch.is_tensor(pbi):
-                        pbi_np = pbi.cpu().numpy()
-                    else:
-                        pbi_np = np.array(pbi)
-                    mask = (pbi_np == b)
-                    if mask.sum() == 0:
-                        continue
-                    prev_pts_np = prev_np_all[mask]
-                else:
-                    prev_pts_np = prev_np_all
-                    try:
-                        if prev_pts_np.shape[1] > end:
-                            col0 = prev_pts_np[:, 0].astype(np.int64)
-                            pm = (col0 == b)
-                            if pm.sum() > 0:
-                                prev_pts_np = prev_pts_np[pm]
-                    except Exception:
-                        pass
-
-                if prev_pts_np.shape[0] == 0:
-                    continue
-
-                # prev xyz slice
-                try:
-                    prev_xyz_np = prev_pts_np[:, start:end].astype(np.float32)
-                except Exception:
-                    prev_xyz_np = prev_pts_np[:, :3].astype(np.float32)
-
-                # ego pose transform if available
-                if self.use_ego and (prev_poses is not None) and (curr_poses is not None) and (k < len(prev_poses)):
-                    try:
-                        ppose = prev_poses[k]
-                        if torch.is_tensor(ppose):
-                            ppose_np = ppose.cpu().numpy()
-                        else:
-                            ppose_np = np.array(ppose)
-                        if ppose_np.ndim == 3:
-                            ppose_b = ppose_np[b]
-                        else:
-                            ppose_b = ppose_np
-                        cpose = curr_poses
-                        if torch.is_tensor(cpose):
-                            cpose_np = cpose.cpu().numpy()
-                        else:
-                            cpose_np = np.array(cpose)
-                        if cpose_np.ndim == 3:
-                            cpose_b = cpose_np[b]
-                        else:
-                            cpose_b = cpose_np
-                        Np = prev_xyz_np.shape[0]
-                        homo = np.concatenate([prev_xyz_np, np.ones((Np, 1), dtype=np.float32)], axis=1)
-                        rel = np.linalg.inv(cpose_b).dot(ppose_b)
-                        transformed = homo.dot(rel.T)[:, :3]
-                        prev_xyz_np = transformed
-                    except Exception:
-                        pass
-
-                # optional downsample prev
-                prev_xyz_np = _maybe_downsample(prev_xyz_np)
-
-                # doppler correction if enabled
-                if self.use_doppler:
-                    try:
-                        dop_vals = prev_pts_np[:, self.dop_idx].astype(np.float32)
-                        prev_ts = self._safe_get_ts(prev_timestamps[k] if prev_timestamps is not None and k < len(prev_timestamps) else None, b)
-                        if (cur_ts is not None) and (prev_ts is not None):
-                            dt = float(cur_ts) - float(prev_ts)
-                        else:
-                            dt = 0.0
-                        if abs(dt) > 1e-9:
-                            norms = np.linalg.norm(prev_xyz_np, axis=1, keepdims=True)
-                            norms = np.where(norms < 1e-6, 1.0, norms)
-                            los = prev_xyz_np / norms
-                            displ = (dop_vals.reshape(-1, 1) * dt * float(self.doppler_scale)) * los
-                            prev_xyz_np = prev_xyz_np + displ
-                    except Exception:
-                        pass
-
-                # Now do radius search ONLY for curr_xyz candidates
-                any_close_np = None
-                if use_ckd:
-                    try:
-                        from scipy.spatial import cKDTree
-                        tree = cKDTree(prev_xyz_np)
-                        curr_xyz_np = curr_xyz.cpu().numpy()
-                        L = curr_xyz_np.shape[0]
-                        any_close_list = []
-                        for s in range(0, L, CHUNK):
-                            e = min(L, s + CHUNK)
-                            chunk = curr_xyz_np[s:e]
-                            res = tree.query_ball_point(chunk, r=self.dist_tol)
-                            any_close_chunk = np.array([1 if len(rr) > 0 else 0 for rr in res], dtype=np.int32)
-                            any_close_list.append(any_close_chunk)
-                        any_close_np = np.concatenate(any_close_list, axis=0)
-                    except Exception:
-                        any_close_np = None
-
-                if any_close_np is None:
-                    try:
-                        prev_t = torch.from_numpy(prev_xyz_np).to(curr_xyz.device)
-                        L = curr_xyz.shape[0]
-                        any_close_list = []
-                        for s in range(0, L, CHUNK):
-                            e = min(L, s + CHUNK)
-                            chunk = curr_xyz[s:e]
-                            dists = torch.cdist(prev_t, chunk)  # (M_prev, chunk_len)
-                            any_close_chunk = (dists <= self.dist_tol).any(dim=0).to(torch.int32).cpu().numpy()
-                            any_close_list.append(any_close_chunk)
-                        any_close_np = np.concatenate(any_close_list, axis=0)
-                    except Exception:
-                        any_close = []
-                        prev_t_cpu = torch.from_numpy(prev_xyz_np)
-                        for i in range(curr_xyz.shape[0]):
-                            pi = curr_xyz[i:i + 1].cpu()
-                            dd = torch.norm(prev_t_cpu - pi, dim=1)
-                            any_close.append(1 if (dd <= self.dist_tol).any().item() else 0)
-                        any_close_np = np.array(any_close, dtype=np.int32)
-
-                # map back to torch and add
-                any_close_t = torch.from_numpy(any_close_np.astype(np.int32)).to(device=device)
-                match_counts += any_close_t.int()
-
-            # write local match_counts to global positions (idx_positions)
-            idxs = torch.from_numpy(idx_positions).long().to(device=device)
-            if idxs.shape[0] != match_counts.shape[0]:
-                L = min(idxs.shape[0], match_counts.shape[0])
-                match_counts_all[idxs[:L]] = match_counts[:L]
-            else:
-                match_counts_all[idxs] = match_counts
-
-        # denom
+            cand_np = None
+    
+        # ---- KDTree availability
         try:
-            valid_hist = sum([1 for p in prev_rdrs[: self.num_history] if (p is not None and getattr(p, 'shape', None) is not None and ((isinstance(p, np.ndarray) and p.shape[0] > 0) or (torch.is_tensor(p) and p.numel() > 0)))])
-            denom = float(min(self.num_history, max(1, int(valid_hist))))
+            from scipy.spatial import cKDTree
+            use_kdtree = True
         except Exception:
-            denom = float(min(self.num_history, max(1, len(prev_rdrs))))
-
-        # cache only when candidate_mask is None
-        if candidate_mask is None:
-            cache[key] = {'match_counts': match_counts_all, 'denom': denom}
-            batch_dict['_tmc_cache'] = cache
-        else:
-            # do not populate cache to avoid mismatch across different candidate subsets
-            batch_dict['_tmc_cache'] = cache
-
+            use_kdtree = False
+    
+        if not use_kdtree:
+            return match_counts_all, 1.0
+    
+        batch_idxs_np = batch_idxs.detach().cpu().numpy()
+    
+        # ================= batch loop =================
+        for b in range(B):
+            mask_b = (batch_idxs_np == b)
+            if cand_np is not None:
+                mask_b &= cand_np
+    
+            idxs = np.nonzero(mask_b)[0]
+            if idxs.size == 0:
+                continue
+    
+            curr_xyz = curr_pts[idxs, start:end].to(device)
+            curr_xyz_np = curr_xyz.detach().cpu().numpy()
+    
+            local_score = torch.zeros((curr_xyz.shape[0],),
+                                      dtype=torch.float32, device=device)
+    
+            meta_b = metas[b]
+            seq = meta_b.get('seq', None)
+            curr_idx_int = meta_b.get('rdr_idx_int', None)
+    
+            # ---- timestamps
+            try:
+                cur_ts = float(meta_b.get('timestamp', None))
+            except Exception:
+                cur_ts = None
+    
+            # ---- ego pose
+            curr_pose = meta_b.get('pose', None) if self.use_ego else None
+    
+            # ================= history loop =================
+            for k in range(1, self.num_history + 1):
+                prev_np = self._load_prev_radar(seq, curr_idx_int, k)
+                if prev_np is None or prev_np.size == 0:
+                    continue
+                if prev_np.shape[1] < end:
+                    continue
+    
+                prev_xyz = prev_np[:, start:end].astype(np.float32)
+    
+                # ---- ego-motion compensation
+                if self.use_ego and curr_pose is not None:
+                    try:
+                        prev_pose = meta_b.get('prev_pose', None)
+                        if prev_pose is not None:
+                            homo = np.concatenate(
+                                [prev_xyz, np.ones((prev_xyz.shape[0], 1))], axis=1
+                            )
+                            rel = np.linalg.inv(curr_pose).dot(prev_pose)
+                            prev_xyz = homo.dot(rel.T)[:, :3]
+                    except Exception:
+                        pass
+    
+                # ---- doppler compensation (rough)
+                if self.use_doppler and prev_np.shape[1] > self.dop_idx:
+                    try:
+                        if cur_ts is not None:
+                            dt = self.default_dt * k
+                            dop = prev_np[:, self.dop_idx].astype(np.float32)
+                            norms = np.linalg.norm(prev_xyz, axis=1, keepdims=True)
+                            norms = np.clip(norms, 1e-6, None)
+                            prev_xyz += (dop[:, None] * dt * self.doppler_scale) * (
+                                prev_xyz / norms
+                            )
+                    except Exception:
+                        pass
+    
+                # ---- downsample
+                if self.max_prev_points > 0 and prev_xyz.shape[0] > self.max_prev_points:
+                    sel = np.random.choice(prev_xyz.shape[0],
+                                           self.max_prev_points,
+                                           replace=False)
+                    prev_xyz = prev_xyz[sel]
+                    prev_np = prev_np[sel]
+    
+                # ---- KDTree local search
+                try:
+                    tree = cKDTree(prev_xyz)
+                    hits = tree.query_ball_point(curr_xyz_np, r=self.dist_tol)
+    
+                    # -------- HARD + SOFT MATCHING --------
+                    hard_hit = np.fromiter(
+                        (1 if len(h) > 0 else 0 for h in hits),
+                        count=len(hits),
+                        dtype=np.float32
+                    )
+    
+                    if self.use_soft and self.use_doppler and prev_np.shape[1] > self.dop_idx:
+                        curr_dop = curr_pts[idxs, self.dop_idx].detach().cpu().numpy()
+                        prev_dop = prev_np[:, self.dop_idx]
+    
+                        soft_scores = np.zeros_like(hard_hit, dtype=np.float32)
+    
+                        for i, h in enumerate(hits):
+                            if len(h) == 0:
+                                continue
+                            dv = prev_dop[h] - curr_dop[i]
+                            w = np.exp(-(dv * dv) /
+                                       (self.soft_doppler_sigma ** 2))
+                            soft_scores[i] = float(w.max())
+    
+                        combined = hard_hit + self.soft_weight * soft_scores
+                    else:
+                        combined = hard_hit
+    
+                    local_score += torch.from_numpy(combined).to(device)
+    
+                except Exception:
+                    pass
+                finally:
+                    if 'tree' in locals():
+                        del tree
+                    del prev_xyz, prev_np
+    
+            match_counts_all[idxs] = local_score
+    
+        denom = float(max(1, self.num_history))
         return match_counts_all, denom
+
+
 
     def get_temporal_scores(self, batch_dict, candidate_mask=None):
         """
