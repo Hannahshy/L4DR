@@ -194,13 +194,13 @@ class KRadarDetection_v2_0(Dataset):
         temp_key = 'label_' + self.label_version
         path_label = meta[temp_key]
         ver = self.label_version
-
+    
         f = open(path_label)
         lines = f.readlines()
         f.close()
         list_tuple_objs = []
         deg2rad = np.pi/180.
-        
+    
         header = (lines[0]).rstrip('\n')
         try:
             temp_idx, tstamp = header.split(', ')
@@ -216,6 +216,57 @@ class KRadarDetection_v2_0(Dataset):
         tstamp = tstamp.split('=')[1]
         dict_idx = dict(rdr=rdr, ldr64=ldr64, camf=camf,\
                         ldr128=ldr128, camr=camr, tstamp=tstamp)
+    
+        # ===== New: populate meta timestamp and rdr_idx_int (frame index) for motion compensation =====
+        # meta may already contain 'seq' set elsewhere; preserve it if present.
+        try:
+            # parse timestamp string into float seconds (safe)
+            ts_val = None
+            try:
+                ts_val = float(tstamp)
+            except Exception:
+                # try to extract numeric prefix if tstamp contains extra chars
+                import re
+                m = re.search(r'([-+]?\d+\.\d+(?:[eE][-+]?\d+)?)', str(tstamp))
+                if m:
+                    ts_val = float(m.group(1))
+            if ts_val is not None:
+                meta['timestamp'] = ts_val
+            else:
+                # leave absent if cannot parse
+                meta['timestamp'] = None
+        except Exception:
+            meta['timestamp'] = None
+    
+        # derive seq and frame index from the label file basename if not present
+        try:
+            # basename format expected like: '00033_00001.txt' or similar
+            basename = osp.basename(path_label)
+            name_no_ext = osp.splitext(basename)[0]
+            parts = name_no_ext.split('_')
+            if 'seq' not in meta or meta.get('seq', None) is None:
+                # first part treated as seq id
+                if len(parts) >= 1 and parts[0] != '':
+                    meta['seq'] = parts[0]
+            # determine radar frame int index: prefer second part if exists
+            if 'rdr_idx_int' not in meta or meta.get('rdr_idx_int', None) is None:
+                if len(parts) >= 2 and parts[1].isdigit():
+                    try:
+                        meta['rdr_idx_int'] = int(parts[1])
+                    except Exception:
+                        meta['rdr_idx_int'] = None
+                else:
+                    # fallback: try use dict_idx fields (ldr64 often holds per-seq frame idx)
+                    try:
+                        meta['rdr_idx_int'] = int(dict_idx.get('ldr64', None)) if dict_idx.get('ldr64', None) is not None else None
+                    except Exception:
+                        meta['rdr_idx_int'] = None
+        except Exception:
+            # be defensive: ensure keys exist
+            meta.setdefault('seq', meta.get('seq', None))
+            meta.setdefault('rdr_idx_int', meta.get('rdr_idx_int', None))
+        # ============================================================================================
+    
         if ver == 'v1_0':
             for line in lines[1:]:
                 # print(line)
@@ -286,7 +337,7 @@ class KRadarDetection_v2_0(Dataset):
                 w = 2*float(list_vals[9])
                 h = 2*float(list_vals[10])
                 list_tuple_objs.append((cls_name, (x, y, z, th, l, w, h), (idx_p), avail))
-
+    
         header = dict_item['meta']['header']
         seq = dict_item['meta']['seq']
         path_calib = osp.join(header, seq, 'info_calib', 'calib_radar_lidar.txt')
@@ -295,7 +346,7 @@ class KRadarDetection_v2_0(Dataset):
             ldr64 = osp.join(header, seq, 'os2-64', f'os2-64_{ldr64}.pcd'),
             desc = osp.join(header, seq, 'description.txt'),
         )
-
+    
         onlyR = self.label.onlyR
         consider_cls = self.label.consider_cls
         if consider_cls | onlyR:
@@ -311,7 +362,7 @@ class KRadarDetection_v2_0(Dataset):
                         continue
                 list_temp.append(obj)
             list_tuple_objs = list_temp
-
+    
         dict_item['meta']['calib'] = self.get_calib_values(path_calib) if self.item.calib else None
         if self.label.calib:
             list_temp = []
@@ -323,7 +374,7 @@ class KRadarDetection_v2_0(Dataset):
                 z = z + dz
                 list_temp.append((cls_name, (x, y, z, th, l, w, h), trk, avail))
             list_tuple_objs = list_temp
-
+    
         if self.label.consider_roi: # after calib
             x_min, y_min, z_min, x_max, y_max, z_max = self.roi.xyz
             check_azimuth_for_rdr = self.roi.check_azimuth_for_rdr
@@ -339,13 +390,51 @@ class KRadarDetection_v2_0(Dataset):
                     continue
                 temp_list.append(obj)
             list_tuple_objs = temp_list
-
+    
         num_obj = len(list_tuple_objs)
-
+    
         dict_item['meta'].update(dict(
             path=dict_path, idx=dict_idx, label=list_tuple_objs, num_obj=num_obj))
         return dict_item
     
+    def _parse_timestamp_from_label_file(self, label_path):
+        """
+        Read the given label text file and extract the timestamp float.
+        Expected line contains 'timestamp=XXXXXXXXX' (as in your screenshot).
+        Returns float seconds, or None on failure.
+        """
+        try:
+            if not os.path.isfile(label_path):
+                return None
+            with open(label_path, 'r', encoding='utf-8', errors='ignore') as f:
+                # read a few lines to find token 'timestamp='
+                for _ in range(5):
+                    line = f.readline()
+                    if not line:
+                        break
+                    if 'timestamp=' in line:
+                        # find substring after 'timestamp=' up to non-numeric / whitespace / comma
+                        try:
+                            # split by 'timestamp=' and then strip separators
+                            tok = line.split('timestamp=')[-1].strip()
+                            # tok may contain trailing characters (comma etc), so keep numeric prefix
+                            # find first char that's not part of float number (digits, dot, minus, e, E)
+                            import re
+                            m = re.match(r'([-+]?\d+\.\d+(?:[eE][-+]?\d+)?)', tok)
+                            if m:
+                                ts = float(m.group(1))
+                                return ts
+                            else:
+                                # fallback: try to parse until comma
+                                tok2 = tok.split(',')[0].strip()
+                                return float(tok2)
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+        return None
+        
+        
     def get_calib_values(self, path_calib):
         f = open(path_calib, 'r')
         lines = f.readlines()
@@ -598,6 +687,42 @@ class KRadarDetection_v2_0(Dataset):
         except Exception:
             dict_item['meta']['rdr_idx_int'] = None
 
+        # 在 __getitem__ 中 curr_idx 已确认后，插入：
+        try:
+            seq = dict_item['meta'].get('seq', None)
+            curr_idx = dict_item['meta'].get('rdr_idx_int', None)
+            prev_ts_list = []
+            if seq is not None and curr_idx is not None:
+                # candidate key forms to try for prev frame index
+                curr_str = str(curr_idx)
+                widths = []
+                # prefer configured width if dataset/ cfg stores it; else try 5, len(curr_str), and no-pad
+                widths.append(5)                 # try common width first (adjust if needed)
+                widths.append(len(curr_str))
+                seen = set()
+                candidates = []
+                for w in widths:
+                    if w is None:
+                        continue
+                    if w in seen:
+                        continue
+                    seen.add(w)
+                    candidates.append(lambda idx, w=w: str(idx).zfill(w))
+                candidates.append(lambda idx: str(idx))  # non-padded
+                for k in range(1, getattr(self, 'num_history', 3) + 1):
+                    found_ts = None
+                    prev_idx = int(curr_idx) - k
+                    for form in candidates:
+                        key = (str(seq), form(prev_idx))
+                        if key in self._frame_timestamp_map:
+                            found_ts = self._frame_timestamp_map.get(key)
+                            break
+                    prev_ts_list.append(found_ts)
+            # only set when at least one prior timestamp exists
+            if any([p is not None for p in prev_ts_list]):
+                dict_item['meta']['prev_timestamps'] = prev_ts_list
+        except Exception:
+            pass
 
         return dict_item
     
