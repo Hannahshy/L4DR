@@ -18,10 +18,10 @@ import warnings
 import logging
 warnings.simplefilter('ignore', category=NumbaWarning)
 warnings.filterwarnings("ignore")
-import os
+import os,re
 import torch
 from .vis import save_frame_vis
-
+import gc
 
 
 from torch.utils.tensorboard import SummaryWriter
@@ -82,6 +82,26 @@ class PipelineDetection_v1_0():
         if self.rank == 0:
             print('* NUM done.')
         self.network = build_network(self).cuda()
+        # --- 插入位置：紧接在 self.network = build_network(self).cuda() 之后 ---
+        try:
+            core_net = self.network.module if hasattr(self.network, 'module') else self.network
+            if hasattr(core_net, 'temporal_comp') and core_net.temporal_comp is not None:
+                core_net.temporal_comp.rdr_index_width = 5   # <-- 把这里改为你数据的实际宽度（例如 5）
+                print(f"[PIPELINE] Set temporal_comp.rdr_index_width = {core_net.temporal_comp.rdr_index_width}")
+            else:
+                print("[PIPELINE] temporal_comp not found on network to set rdr_index_width")
+        except Exception as e:
+            print("[PIPELINE] Exception while setting rdr_index_width:", e)
+        try: 
+            if hasattr(self, 'network') and self.network is not None: 
+                net = self.network 
+            if hasattr(net, 'temporal_comp') and net.temporal_comp is not None: 
+                net.temporal_comp.debug = True 
+                print("[TMC DEBUG] Enabled temporal_comp.debug on self.network") 
+            else: print("[TMC DEBUG] self.network has no temporal_comp attribute") 
+        except Exception as e: 
+            print("[TMC DEBUG] enable exception:", e)
+        
         if self.rank == 0:
             print('* network done.')
         self.optimizer = build_optimizer(self, self.network)
@@ -277,6 +297,96 @@ class PipelineDetection_v1_0():
                 batch_size = self.cfg.OPTIMIZER.BATCH_SIZE, shuffle = is_shuffle, \
                 collate_fn = self.dataset_train.collate_fn,
                 num_workers = self.cfg.OPTIMIZER.NUM_WORKERS, drop_last = True)
+                
+
+        try:
+            ds = getattr(self, 'dataset', None)
+            mdl = getattr(self, 'network', None)
+            seq_median_map = {}
+        
+            # try to obtain label root dir from dataset first, else from cfg (common patterns)
+            label_root = None
+            if ds is not None and hasattr(ds, 'label_root'):
+                label_root = ds.label_root
+            else:
+                # try common cfg locations: cfg.DATASET.path_data.revised_label_v2_0 or cfg.DATASET.path_data.list_dir_kradar
+                try:
+                    # prefer explicit revised_label_v2_0 if present
+                    label_root = self.cfg.DATASET.path_data.get('revised_label_v2_0', None) or self.cfg.DATASET.path_data.get('revised_label_v1_1', None)
+                except Exception:
+                    try:
+                        label_root = self.cfg.DATASET.path_data.list_dir_kradar[0]
+                    except Exception:
+                        label_root = None
+        
+            if label_root is None or not os.path.isdir(label_root):
+                print("[PIPELINE] Warning: label_root not found or not a dir:", label_root)
+            else:
+                # Expect structure: <label_root>/<seq_id>/*.txt
+                for seq_name in sorted(os.listdir(label_root)):
+                    seq_dir = os.path.join(label_root, seq_name)
+                    if not os.path.isdir(seq_dir):
+                        continue
+                    ts_list = []
+                    # iterate files sorted to preserve time order by file names
+                    for fn in sorted(os.listdir(seq_dir)):
+                        if not fn.lower().endswith('.txt'):
+                            continue
+                        fp = os.path.join(seq_dir, fn)
+                        try:
+                            with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                                for _ in range(5):
+                                    line = f.readline()
+                                    if not line:
+                                        break
+                                    if 'timestamp=' in line:
+                                        m = re.search(r'timestamp=([-+]?\d+\.\d+(?:[eE][-+]?\d+)?)', line)
+                                        if m:
+                                            ts_list.append(float(m.group(1)))
+                                        else:
+                                            # fallback: split by 'timestamp=' and take numeric prefix
+                                            tok = line.split('timestamp=')[-1].strip()
+                                            tok = tok.split(',')[0].strip()
+                                            try:
+                                                ts_list.append(float(tok))
+                                            except Exception:
+                                                pass
+                                        break
+                        except Exception:
+                            continue
+                    if len(ts_list) >= 2:
+                        diffs = np.diff(np.array(ts_list, dtype=np.float64))
+                        median_dt = float(np.median(diffs))
+                        seq_median_map[seq_name] = median_dt
+        
+            # assign to model.temporal_comp if available
+            if mdl is not None and hasattr(mdl, 'temporal_comp') and mdl.temporal_comp is not None:
+                mdl.temporal_comp.seq_median_dt = seq_median_map
+                if seq_median_map:
+                    mdl.temporal_comp.use_median_dt = True
+                print(f"[PIPELINE] Assigned seq_median_dt for {len(seq_median_map)} sequences")
+            else:
+                print("[PIPELINE] Warning: model.temporal_comp not found; cannot assign seq_median_dt")
+        
+        except Exception as e:
+            print(f"[PIPELINE] Exception while computing seq_median_dt: {e}")
+        
+        # debug flag check
+        try:
+            net = getattr(self, 'network', None)
+            if hasattr(net, 'module'):
+                core = net.module
+            else:
+                core = net
+            if core is not None and hasattr(core, 'temporal_comp') and core.temporal_comp is not None:
+                print("[PIPELINE DEBUG CHECK] temporal_comp.debug =", core.temporal_comp.debug, 
+                      "use_median_dt=", core.temporal_comp.use_median_dt, 
+                      "seq_median_count=", len(getattr(core.temporal_comp, 'seq_median_dt', {})))
+            else:
+                print("[PIPELINE DEBUG CHECK] temporal_comp not found on network at train start")
+        except Exception as e:
+            print("[PIPELINE DEBUG CHECK] Exception:", e)
+        
         epoch_start = self.epoch_start
         epoch_end = self.cfg.OPTIMIZER.MAX_EPOCH
 
@@ -305,6 +415,53 @@ class PipelineDetection_v1_0():
                 if self.optim_fastai:
                     self.scheduler.step(accumulated_iter, epoch)
                 #torch.cuda.empty_cache()
+                # 仅在第一个 batch 做一次轻量打印
+                if idx_iter == 0:
+                    try:
+                        print("[PIPELINE BATCH CHECK] First batch keys:", list(dict_datum.keys()))
+                        if 'meta' in dict_datum:
+                            print("[PIPELINE BATCH CHECK] meta[0] timestamp:", dict_datum['meta'][0].get('timestamp', None))
+                            print("[PIPELINE BATCH CHECK] meta[0] seq, rdr_idx_int:", dict_datum['meta'][0].get('seq', None), dict_datum['meta'][0].get('rdr_idx_int', None))
+                        print("[PIPELINE BATCH CHECK] has 'rdr_sparse' in batch:", 'rdr_sparse' in dict_datum)
+                        if 'rdr_sparse' in dict_datum:
+                            print("[PIPELINE BATCH CHECK] rdr_sparse shape (total points):", dict_datum['rdr_sparse'].shape if hasattr(dict_datum['rdr_sparse'], 'shape') else None)
+                    except Exception as e:
+                        print("[PIPELINE BATCH CHECK] Exception reading first batch info:", e)
+                  
+                # 检查 meta 是否包含 prev_timestamps 且其内容
+                print("meta keys:", dict_datum['meta'][0].keys())
+                print("meta prev_timestamps:", dict_datum['meta'][0].get('prev_timestamps', None))
+                # 打印你 dataset.build 的 timestamp map 中该序列的条目（看 map 是否包含 prev frames）
+                ds = self.dataset_train if getattr(self, 'dataset_train', None) is not None else self.dataset_test
+                if hasattr(ds, '_frame_timestamp_map'):
+                    seq = dict_datum['meta'][0].get('seq')
+                    print("frame timestamp map keys for seq sample:")
+                    for k in list(ds._frame_timestamp_map.keys())[:50]:
+                        if k[0] == str(seq):
+                            print("  ", k, ds._frame_timestamp_map[k])
+                # 放在 pipeline.train_network 的第一个 batch 后（或在看到 TMC CALL CHECK 时运行）
+                try:
+                    net = getattr(self, 'network', None)
+                    core = net.module if hasattr(net, 'module') else net
+                    tmc = getattr(core, 'temporal_comp', None)
+                    seq = dict_datum['meta'][0].get('seq')
+                    curr_idx = dict_datum['meta'][0].get('rdr_idx_int')
+                    if tmc is None:
+                        print("[CHECK_PREV_FILES] temporal_comp not found on network")
+                    else:
+                        print("[CHECK_PREV_FILES] rdr_sparse_dir =", tmc.rdr_sparse_dir,
+                              "rdr_file_prefix =", tmc.rdr_file_prefix,
+                              "rdr_file_ext =", tmc.rdr_file_ext,
+                              "num_history =", tmc.num_history)
+                        for k in range(1, tmc.num_history + 1):
+                            prev_idx = int(curr_idx) - int(k)
+                            width = len(str(curr_idx))  # same logic as _load_prev_radar
+                            prev_str = str(prev_idx).zfill(width)
+                            path = os.path.join(tmc.rdr_sparse_dir, str(seq), f"{tmc.rdr_file_prefix}{prev_str}{tmc.rdr_file_ext}")
+                            print(f"  k={k} -> trying: {path}  exists={os.path.isfile(path)}")
+                except Exception as e:
+                    print("[CHECK_PREV_FILES] Exception:", e)  
+                    
                 dict_net = self.network(dict_datum)
                 dict_net['epoch'] = epoch+1
                 str_exp = self.mode +'_'+ self.tag
@@ -371,6 +528,9 @@ class PipelineDetection_v1_0():
                                 dict_item[k] = None
                 for temp_key in dict_datum.keys():
                     dict_datum[temp_key] = None
+                    
+                gc.collect()
+                torch.cuda.empty_cache()
 
             if self.rank==0 and self.is_save_model :
                 # epoch: indexing from 0
@@ -422,6 +582,8 @@ class PipelineDetection_v1_0():
     def load_dict_model(self, path_dict_model, is_strict=False):
         x = torch.load(path_dict_model)
         self.network.load_state_dict(x,False)
+        
+    
 
     # V2
     def vis_infer(self, sample_indices, conf_thr=0.7, is_nms=True, vis_mode=['lpc', 'spcube', 'cube'], is_train=False):
@@ -665,6 +827,9 @@ class PipelineDetection_v1_0():
                             dict_item[k] = None
             for temp_key in dict_datum.keys():
                 dict_datum[temp_key] = None
+                
+            gc.collect()
+            torch.cuda.empty_cache()
             tqdm_bar.update(1)
         tqdm_bar.close()
 
@@ -1032,6 +1197,9 @@ class PipelineDetection_v1_0():
                                 dict_item[k] = None
                 for temp_key in dict_datum.keys():
                     dict_datum[temp_key] = None
+                    
+                gc.collect()
+                torch.cuda.empty_cache()
                 tqdm_bar.update(1)
             tqdm_bar.close()
             if savevis:
