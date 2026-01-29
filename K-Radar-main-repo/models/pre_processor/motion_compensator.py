@@ -47,6 +47,15 @@ class TemporalMotionCompensator:
         self._use_cKDTree_prefer = bool(mcfg.get('USE_CKDTREE', True))
         # debug flag
         self.debug = bool(mcfg.get('DEBUG', False))
+        # ---- lightweight diagnostics (only when debug True)
+        # internal counters for diagnostics (keeps small memory)
+        self._dbg_print_interval = int(mcfg.get('DBG_PRINT_INTERVAL', 100))  # print every N calls when debug
+        self._dbg_call_counter = 0
+        self._dbg_src_counts = {'prev_ts': 0, 'seq_median': 0, 'default': 0}
+        self._dbg_match_counts_hist = {}  # simple bin count mapping: int_count -> occurrences
+        self._dbg_tscore_sum = 0.0
+        self._dbg_tscore_sum_sq = 0.0
+        self._dbg_tscore_n = 0
 
         # ---- dataset / io related (align with cfg.rdr_sparse) ----
         self.rdr_sparse_dir = None
@@ -69,9 +78,20 @@ class TemporalMotionCompensator:
 
         # history indexing
         self.require_meta_idx = True   # assert meta contains rdr_idx_int
+        try:
+            self.rdr_index_width = None
+            if isinstance(mcfg, dict) and ('RDR_INDEX_WIDTH' in mcfg):
+                self.rdr_index_width = int(mcfg.get('RDR_INDEX_WIDTH', None))
+            else:
+                # also accept lowercase key names
+                self.rdr_index_width = int(mcfg.get('rdr_index_width')) if mcfg.get('rdr_index_width', None) is not None else None
+        except Exception:
+            self.rdr_index_width = None
         # temporal dt handling
         self.default_dt = float(mcfg.get('DEFAULT_DT', 0.1))   # fallback per-frame dt (seconds)
         self.seq_median_dt = {}   # {seq_id: median_dt}  # dataset or trainer should populate this mapping
+        self.min_dt = float(mcfg.get('MIN_DT', 0.01))   # 最小允许 dt (s)
+        self.max_dt = float(mcfg.get('MAX_DT', 1.0))    # 最大允许 dt (s)
         self.use_median_dt = bool(mcfg.get('USE_MEDIAN_DT', True))
         # soft matching (doppler-aware)
         self.use_soft = bool(mcfg.get('USE_SOFT_MATCH', True))
@@ -162,27 +182,34 @@ class TemporalMotionCompensator:
         if prev_idx < 0:
             return None
 
-        # keep same zero-padding width as current index
         curr_str = str(curr_idx_int)
-        width = len(curr_str)
-        prev_str = str(prev_idx).zfill(width)
-
-        path = os.path.join(
-            self.rdr_sparse_dir,
-            str(seq),
-            f'{self.rdr_file_prefix}{prev_str}{self.rdr_file_ext}'
-        )
-
-        if not os.path.isfile(path):
-            return None
-
-        try:
-            arr = np.load(path, mmap_mode='r')   # ★ mmap not loading whole file into RAM
-            if arr.ndim != 2 or arr.shape[1] < self.n_used:
-                return None
-            return arr
-        except Exception:
-            return None
+        widths = []
+        if getattr(self, 'rdr_index_width', None) is not None:
+            widths.append(int(self.rdr_index_width))
+        widths.append(len(curr_str))
+        # remove duplicates and None
+        widths = [w for i,w in enumerate(widths) if w is not None and w not in widths[:i]]
+        
+        candidates = []
+        for w in widths:
+            candidates.append(str(prev_idx).zfill(w))
+        # also try non-padded
+        candidates.append(str(prev_idx))
+        
+        for prev_str in candidates:
+            path = os.path.join(self.rdr_sparse_dir, str(seq), f'{self.rdr_file_prefix}{prev_str}{self.rdr_file_ext}')
+            if getattr(self, 'debug', False):
+                print(f"[TMC LOAD PREV] trying: {path} exists={os.path.isfile(path)}")
+            if os.path.isfile(path):
+                try:
+                    arr = np.load(path, mmap_mode='r')
+                    if arr.ndim != 2 or arr.shape[1] < self.n_used:
+                        return None
+                    return arr
+                except Exception:
+                    return None
+        # if no candidate matched
+        return None
 
 
     def _compute_match_counts(self, batch_dict, candidate_mask=None):
@@ -285,39 +312,76 @@ class TemporalMotionCompensator:
                         pass
 
                 # ---- doppler compensation (robust fallback using timestamps or seq_median_dt)
+                # 替换 doppler 补偿处（在 _compute_match_counts 中）
                 if self.use_doppler and prev_np.shape[1] > self.dop_idx:
                     try:
-                        # Try per-prev timestamps if available
+                        # 1) Try per-prev timestamps if provided (meta should contain 'prev_timestamps' list aligned with k)
                         dt = None
+                        prev_timestamps_list = meta_b.get('prev_timestamps', None)
                         if (cur_ts is not None) and (prev_timestamps_list is not None):
                             try:
-                                # prev_timestamps_list is expected to be list-like with order [t_prev1, t_prev2, ...]
                                 if isinstance(prev_timestamps_list, (list, tuple, np.ndarray)) and len(prev_timestamps_list) >= k:
-                                    prev_ts_k = float(prev_timestamps_list[k-1])
+                                    prev_ts_k = float(prev_timestamps_list[k - 1])
                                     dt = float(cur_ts) - float(prev_ts_k)
                             except Exception:
                                 dt = None
-
-                        # If no per-prev timestamps, try seq median dt
+                
+                        # 2) If no per-prev timestamp, use seq_median_dt if available
                         if dt is None:
                             if self.use_median_dt and (seq in self.seq_median_dt) and (self.seq_median_dt[seq] is not None):
                                 dt = float(self.seq_median_dt[seq]) * float(k)
                             else:
                                 dt = float(self.default_dt) * float(k)
+                
+                        # 3) Validate & clamp dt (protect against bad timestamps)
+                        # Reject non-finite / non-positive or too-large dt; fallback to defaults if needed
+                        try:
+                            if (not np.isfinite(dt)) or (dt <= 0.0) or (dt > float(self.max_dt) * float(k)):
+                                # attempt fallback to seq_median_dt or default if available
+                                if self.use_median_dt and (seq in self.seq_median_dt):
+                                    dt = float(self.seq_median_dt[seq]) * float(k)
+                                else:
+                                    dt = float(self.default_dt) * float(k)
+                        except Exception:
+                            dt = float(self.default_dt) * float(k)
+                
+                        # final clamp to [min_dt, max_dt]
+                        try:
+                            dt = float(np.clip(float(dt), float(self.min_dt), float(self.max_dt)))
+                        except Exception:
+                            dt = float(self.default_dt) * float(k)
+                
+                        if self.debug:
+                            # decide source label
+                            if (cur_ts is not None) and (prev_timestamps_list is not None) and (isinstance(prev_timestamps_list, (list,tuple,np.ndarray)) and len(prev_timestamps_list) >= k):
+                                source = 'prev_ts'
+                            elif (self.use_median_dt and (seq in self.seq_median_dt)):
+                                source = 'seq_median'
+                            else:
+                                source = 'default'
+                            # update per-call diagnostic source counts
+                            if self.debug:
+                                try:
+                                    self._dbg_src_counts[source] += 1
+                                except Exception:
+                                    pass
+    
+                                # lightweight per-attempt debug print (single-line)
+                                print(f"[TMC DEBUG] seq={seq} k={k} used_dt={dt:.6f} source={source} cur_ts={cur_ts} prev_ts_k={(prev_timestamps_list[k-1] if prev_timestamps_list is not None and len(prev_timestamps_list) >= k else None)} seq_median={self.seq_median_dt.get(seq, None)}", flush=True)
 
-                        if abs(dt) > 1e-9:
-                            dop = prev_np[:, self.dop_idx].astype(np.float32)
-                            norms = np.linalg.norm(prev_xyz, axis=1, keepdims=True)
-                            norms = np.clip(norms, 1e-6, None)
-                            prev_xyz += (dop[:, None] * dt * self.doppler_scale) * (prev_xyz / norms)
+                
+                        # apply doppler shift (numpy path)
+                        dop = prev_np[:, self.dop_idx].astype(np.float32)
+                        norms = np.linalg.norm(prev_xyz, axis=1, keepdims=True)
+                        norms = np.clip(norms, 1e-6, None)
+                        prev_xyz += (dop[:, None] * dt * self.doppler_scale) * (prev_xyz / norms)
                     except Exception:
                         pass
 
                 # ---- downsample
                 if self.max_prev_points > 0 and prev_xyz.shape[0] > self.max_prev_points:
-                    sel = np.random.choice(prev_xyz.shape[0],
-                                           self.max_prev_points,
-                                           replace=False)
+                    power_arr = prev_np[:, self.power_idx]
+                    sel = np.argsort(power_arr)[-self.max_prev_points:]
                     prev_xyz = prev_xyz[sel]
                     prev_np = prev_np[sel]
 
@@ -362,6 +426,50 @@ class TemporalMotionCompensator:
 
             match_counts_all[idxs] = local_score
 
+        # Diagnostics aggregation (per call)
+        if self.debug:
+            try:
+                self._dbg_call_counter += 1
+                # tally match_counts histogram (clip to reasonable max bin)
+                try:
+                    mc_np = match_counts_all.detach().cpu().numpy().astype(int)
+                    # clip to [0, 50] for hist bins
+                    mc_np = np.clip(mc_np, 0, 50)
+                    unique, counts = np.unique(mc_np, return_counts=True)
+                    for u, c in zip(unique, counts):
+                        self._dbg_match_counts_hist[int(u)] = self._dbg_match_counts_hist.get(int(u), 0) + int(c)
+                except Exception:
+                    pass
+
+                # accumulate t_score stats
+                try:
+                    # compute temporary t_scores for diagnostics
+                    denom = float(max(1, self.num_history))
+                    t_scores_tmp = match_counts_all.float() / denom
+                    t_np = t_scores_tmp.detach().cpu().numpy()
+                    self._dbg_tscore_sum += float(t_np.sum())
+                    self._dbg_tscore_sum_sq += float((t_np * t_np).sum())
+                    self._dbg_tscore_n += t_np.size
+                except Exception:
+                    pass
+
+                # periodic print of aggregated diagnostics
+                if (self._dbg_call_counter % max(1, self._dbg_print_interval)) == 0:
+                    # compute t_score mean/std
+                    t_mean = (self._dbg_tscore_sum / self._dbg_tscore_n) if self._dbg_tscore_n > 0 else 0.0
+                    t_var = (self._dbg_tscore_sum_sq / self._dbg_tscore_n - t_mean * t_mean) if self._dbg_tscore_n > 0 else 0.0
+                    t_std = float(np.sqrt(max(0.0, t_var)))
+                    print("=== [TMC AGG STATS] ===", flush=True)
+                    print(f"* dbg_calls = {self._dbg_call_counter}", flush=True)
+                    print(f"* src_counts = {self._dbg_src_counts}", flush=True)
+                    # print a compact histogram (small bins)
+                    hist_items = sorted(self._dbg_match_counts_hist.items())
+                    print(f"* match_counts_hist (sampled bins) = {hist_items[:20]}", flush=True)
+                    print(f"* t_score mean/std = {t_mean:.6f} / {t_std:.6f} (n_points={self._dbg_tscore_n})", flush=True)
+                    print("=======================", flush=True)
+            except Exception:
+                pass
+        
         denom = float(max(1, self.num_history))
         return match_counts_all, denom
 
@@ -376,6 +484,15 @@ class TemporalMotionCompensator:
         if denom <= 0:
             denom = 1.0
         score = match_counts.float() / float(denom)
+        # optional quick per-batch print (only if debug and small batch)
+        if self.debug:
+            try:
+                s_np = score.detach().cpu().numpy()
+                # print quick hist up to 10 bins
+                vals, cnts = np.unique(np.clip(np.floor(s_np * 10).astype(int), 0, 10), return_counts=True)
+                print(f"[TMC SCORE HIST] bins0-10 counts: {list(zip(vals.tolist(), cnts.tolist()))}", flush=True)
+            except Exception:
+                pass
         return score.clamp(0.0, 1.0)
 
     def get_temporal_mask(self, batch_dict):
