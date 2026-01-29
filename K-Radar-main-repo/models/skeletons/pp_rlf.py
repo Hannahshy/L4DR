@@ -396,12 +396,8 @@ class PointPillar_RLF(nn.Module):
             print(f"* Warning: failed to instantiate MMESparseProcessor: {e}")
             self.mme = None
 
-        # Instantiate temporal motion compensator
+        # Instantiate temporal motion compensator — pass full cfg so compensator can access DATASET fields
         try:
-            try:
-                motion_cfg = cfg.MODEL.PRE_PROCESSING.MOTION_COMPENSATION
-            except Exception:
-                motion_cfg = getattr(cfg.MODEL.PRE_PROCESSING, 'MOTION_COMPENSATION', None)
             self.temporal_comp = TemporalMotionCompensator(cfg)
             print("* TemporalMotionCompensator instantiated (enabled=%s)" % self.temporal_comp.enabled)
         except Exception as e:
@@ -888,8 +884,42 @@ class PointPillar_RLF(nn.Module):
                             candidate_mask[idxs_b[topk_idx]] = True
 
             # --- 3) 仅对 candidate 计算 temporal scores ---
+                
+            # 在调用 temporal_comp.get_temporal_scores 前（pp_rlf）
             try:
+                # --- DIAGNOSTIC: candidate_mask summary (improved) ---
+                if candidate_mask is not None and getattr(self, 'dataset_cfg', None) is not None:
+                    try:
+                        n_total = int(candidate_mask.numel())
+                        n_true = int(candidate_mask.sum().item())
+                        ratio = n_true / float(max(1, n_total))
+                        print(f"[CANDMASK DIAG] total={n_total}, true={n_true}, ratio={ratio:.4f}")
+                        # sample a few true global indices (safe)
+                        try:
+                            trues = torch.nonzero(candidate_mask, as_tuple=False).view(-1)
+                            if trues.numel() > 0:
+                                sample_trues = trues[:20].cpu().tolist()
+                                print("[CANDMASK DIAG] sample_true_global_indices:", sample_trues)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                # call temporal_comp (original)
                 t_scores_full = self.temporal_comp.get_temporal_scores(batch_dict, candidate_mask=candidate_mask)
+                # DIAG: immediate t_scores check (small sample)
+                try:
+                    if getattr(self.temporal_comp, 'debug', False):
+                        ts_np = t_scores_full.detach().cpu().numpy()
+                        print(f"[TMC CALL DIAG] t_scores mean={ts_np.mean():.6f}, std={ts_np.std():.6f}, min={ts_np.min():.6f}, max={ts_np.max():.6f}")
+                        # print small histogram (10 bins)
+                        import numpy as _np
+                        bins = _np.linspace(0,1,11)
+                        hist = _np.histogram(ts_np, bins=bins)[0]
+                        print("[TMC CALL DIAG] t_scores_hist_10bins:", hist.tolist())
+                except Exception:
+                    pass
+
                 t_scores_full = t_scores_full.to(device=device).float()
             except Exception as e:
                 print(f"* Warning: temporal_comp.get_temporal_scores(candidate_mask=...) failed: {e}. Falling back to full compute.")
