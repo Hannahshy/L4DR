@@ -492,9 +492,51 @@ class BiDF_PillarVFE(VFETemplate):
         l_ex_features[l2r_com_L, :, now_feature_idx : now_feature_idx + lidartoradar_f_cluster.shape[-1]] = lidartoradar_f_cluster #3
         now_feature_idx += lidartoradar_f_cluster.shape[-1]
         #radar特征部分先填充均值后面是radar的话会覆盖
-        extraFea_R = (radar_voxel_features[l2r_com_R, :, 3:] * mask).sum(dim=1, keepdim=True) / num_valid.type_as(radar_voxel_features).view(-1, 1, 1)
-        l_ex_features[l2r_com_L, :, now_feature_idx :] = extraFea_R #4
-        now_feature_idx += extraFea_R.shape[-1]
+        #extraFea_R = (radar_voxel_features[l2r_com_R, :, 3:] * mask).sum(dim=1, keepdim=True) / num_valid.type_as(radar_voxel_features).view(-1, 1, 1)
+        #l_ex_features[l2r_com_L, :, now_feature_idx :] = extraFea_R #4
+        #now_feature_idx += extraFea_R.shape[-1]
+        
+        # --- REPLACED BLOCK: robustly compute and scatter extraFea_R into l_ex_features ---
+        # compute aggregated radar extra channels for matched pairs (keep full channels)
+        if l2r_com_R.numel() > 0:
+            # extraFea_R shape from original computation: (n_sel, 1, rem)  (rem = radar_feat_dim - 3)
+            extraFea_R = (radar_voxel_features[l2r_com_R, :, 3:] * mask).sum(dim=1, keepdim=True) \
+                         / (num_valid.type_as(radar_voxel_features).view(-1, 1, 1) + 1e-6)
+        
+            # squeeze the middle dim to get (n_sel, rem)
+            ef = extraFea_R.squeeze(1)  # shape: (n_sel, rem)
+            w = ef.shape[-1]  # actual number of extra channels
+        
+            if w > 0:
+                # Expand to (n_sel, num_points_per_voxel, w) so it can be assigned into l_ex_features[l2r_com_L, :, now_feature_idx: now_feature_idx+w]
+                # l_ex_features second dim is the max points per lidar voxel (usually 32)
+                num_pts = l_ex_features.shape[1]
+                # ef_exp shape: (n_sel, num_pts, w)
+                ef_exp = ef.unsqueeze(1).expand(-1, num_pts, -1).contiguous()
+        
+                # Safety: ensure indices fit in allocated l_ex_features width
+                end_idx = now_feature_idx + w
+                if end_idx > l_ex_features.shape[2]:
+                    # truncate ef_exp to fit, and warn
+                    print(f"* Warning: extraFea_R width ({w}) exceeds remaining l_ex_features capacity ({l_ex_features.shape[2] - now_feature_idx}); truncating.")
+                    w = l_ex_features.shape[2] - now_feature_idx
+                    if w <= 0:
+                        # nothing can be written
+                        ef_exp = ef_exp.new_zeros((ef_exp.shape[0], ef_exp.shape[1], 0))
+                    else:
+                        ef_exp = ef_exp[:, :, :w].contiguous()
+        
+                # assign (write broadcasted extra features into point-dimension)
+                if ef_exp.shape[-1] > 0:
+                    l_ex_features[l2r_com_L, :, now_feature_idx : now_feature_idx + ef_exp.shape[-1]] = ef_exp
+                    now_feature_idx += ef_exp.shape[-1]
+            else:
+                # no extra radar channels to write
+                pass
+        else:
+            # no matched radar->lidar pairs: nothing to write; leave zeros
+            pass
+        # --- END REPLACED BLOCK ---
 
         lidar_features = l_ex_features
         final_voxel_count = lidar_features.shape[1]
@@ -517,6 +559,8 @@ class BiDF_PillarVFE(VFETemplate):
         batch_dict['lidar_pillar_features'] = lidar_features
         batch_dict['radar_pillar_features'] = radar_features
         return batch_dict
+
+
 
 
 
