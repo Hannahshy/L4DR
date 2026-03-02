@@ -1030,11 +1030,6 @@ class BaseBEVBackbone_MF(nn.Module):
             ))
 
         self.num_bev_features = c_in * 2
-        
-        # debug counter for periodic logging
-        self._debug_iter = 0
-        self._debug_interval = 500   # 每 500 iter 打印一次（你可以改成 200 / 1000）
-
 
     
         # ---------- Uncertainty-aware Gated Fusion (UAGF) ----------
@@ -1048,7 +1043,7 @@ class BaseBEVBackbone_MF(nn.Module):
         self.uagf_hidden = int(uagf_cfg.get('HIDDEN', 32))
         if self.uagf_enabled:
             # input channels: lidar + radar + 1(conf)
-            in_ch = int(num_bev_features) + 1
+            in_ch = int(input_channels) + 1
             self.uagf_gate = nn.Sequential(
                 nn.Conv2d(in_ch, self.uagf_hidden, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(self.uagf_hidden),
@@ -1058,7 +1053,13 @@ class BaseBEVBackbone_MF(nn.Module):
             )
         else:
             self.uagf_gate = None
-def forward(self, data_dict):
+        
+        # debug counter for periodic logging
+        self._debug_iter = 0
+        self._debug_interval = 500
+
+            
+    def forward(self, data_dict):
         """
         Args:
             data_dict:
