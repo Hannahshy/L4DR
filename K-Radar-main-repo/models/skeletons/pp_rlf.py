@@ -91,6 +91,12 @@ class VoxelGeneratorWrapper():
                     max_num_points_per_voxel, max_num_voxels
                 )
 
+        # expose grid size for downstream BEV scatter utilities
+        try:
+            self.grid_size = self._voxel_generator.grid_size
+        except Exception:
+            self.grid_size = None
+
     def generate(self, points):
         if self.spconv_ver == 1:
             voxel_output = self._voxel_generator.generate(points)
@@ -138,11 +144,43 @@ class PointPillar_RLF(nn.Module):
             pass
 
         # Common params - read raw per-point dims from dataset cfg
+                # Common params - read raw per-point dims from dataset cfg
         ldr_n_used = int(self.dataset_cfg.ldr64.n_used)
         rdr_n_used = int(self.dataset_cfg.rdr_sparse.n_used)
+        self.rdr_n_used_base = int(rdr_n_used)
+
+        # Keep radar feature dim for voxelization/VFE equal to dataset_cfg.rdr_sparse.n_used.
+        # Temporal score t_scores is used later for point-level pre-filtering and BEV confidence map (UAGF),
+        # but is NOT appended into rdr_sparse before voxelization to avoid full temporal compute and
+        # spconv Point2Voxel feature-dim mismatch.
+        self.rdr_n_used_vfe = int(self.rdr_n_used_base)
+        rdr_n_used = self.rdr_n_used_vfe
+
+        # VFE radar-score channel (used inside BiDF_PillarVFE when USE_RadarSCORE=True)
+        self.vfe_use_radar_score = bool(getattr(self.model_cfg.VFE, 'USE_RadarSCORE', self.model_cfg.VFE.get('USE_RadarSCORE', False)))
+        self.rdr_score_col = (self.rdr_n_used_vfe - 1) if self.vfe_use_radar_score else None
+
+        # Motion compensation config (still used later in forward)
+        mc_cfg = {}
+        try:
+            mc_cfg = self.model_cfg.PRE_PROCESSING.MOTION_COMPENSATION
+        except Exception:
+            mc_cfg = {}
+        self.mc_enabled = bool(getattr(mc_cfg, 'ENABLED', mc_cfg.get('ENABLED', False)) if mc_cfg is not None else False)
+        self.mc_add_to_point_features = bool(getattr(mc_cfg, 'ADD_TO_POINT_FEATURES', mc_cfg.get('ADD_TO_POINT_FEATURES', False)) if mc_cfg is not None else False)
+        self.mc_feat_dim = int(getattr(mc_cfg, 'FEAT_DIM', mc_cfg.get('FEAT_DIM', 1)) if mc_cfg is not None else 1)
+
         extra_lidar_channels = max(0, ldr_n_used - 3)
         num_rawpoint_features = [ldr_n_used, rdr_n_used + extra_lidar_channels]
         self.num_point_features = num_rawpoint_features
+        self.mc_add_to_rdr_sparse_for_vfe = bool(getattr(mc_cfg, 'ADD_TO_RDR_SPARSE_FOR_VFE', mc_cfg.get('ADD_TO_RDR_SPARSE_FOR_VFE', False)) if mc_cfg is not None else False)
+
+        # If VFE expects a radar score channel (USE_RadarSCORE), we create/keep one extra dim in rdr_sparse
+        self.vfe_use_radar_score = bool(getattr(self.model_cfg.VFE, 'USE_RadarSCORE', self.model_cfg.VFE.get('USE_RadarSCORE', False)))
+        
+        self.rdr_score_col = self.rdr_n_used_vfe - 1  # last column when enabled
+        extra_lidar_channels = max(0, ldr_n_used - 3)
+
 
         point_cloud_range = np.array(self.dataset_cfg.roi.xyz)
         voxel_size = self.dataset_cfg.roi.voxel_size
@@ -175,14 +213,14 @@ class PointPillar_RLF(nn.Module):
         self.rdr_voxel_generator_train = VoxelGeneratorWrapper(
             vsize_xyz=voxel_size,
             coors_range_xyz=point_cloud_range,
-            num_point_features=rdr_n_used,
+            num_point_features=self.rdr_n_used_vfe,
             max_num_points_per_voxel=self.model_cfg.PRE_PROCESSING.MAX_POINTS_PER_VOXEL,
             max_num_voxels=self.model_cfg.PRE_PROCESSING.MAX_NUMBER_OF_VOXELS['train'],
         )
         self.rdr_voxel_generator_test = VoxelGeneratorWrapper(
             vsize_xyz=voxel_size,
             coors_range_xyz=point_cloud_range,
-            num_point_features=rdr_n_used,
+            num_point_features=self.rdr_n_used_vfe,
             max_num_points_per_voxel=self.model_cfg.PRE_PROCESSING.MAX_POINTS_PER_VOXEL,
             max_num_voxels=self.model_cfg.PRE_PROCESSING.MAX_NUMBER_OF_VOXELS['test'],
         )
@@ -301,13 +339,11 @@ class PointPillar_RLF(nn.Module):
             except Exception:
                 motion_cfg = None
 
-        if motion_cfg is not None and (hasattr(motion_cfg, 'get') or isinstance(motion_cfg, dict)):
+        if motion_cfg is not None and isinstance(motion_cfg, dict):
             self._add_temporal_to_point_features = bool(motion_cfg.get('ADD_TO_POINT_FEATURES', False))
             self._temporal_feat_dim = int(motion_cfg.get('FEAT_DIM', 1))
         else:
-            self._add_temporal_to_point_features = False
             self._temporal_feat_dim = 1
-
 
         # Build VFE
         self.vfe = vfe.__all__[self.model_cfg.VFE.NAME](
@@ -396,8 +432,12 @@ class PointPillar_RLF(nn.Module):
             print(f"* Warning: failed to instantiate MMESparseProcessor: {e}")
             self.mme = None
 
-        # Instantiate temporal motion compensator — pass full cfg so compensator can access DATASET fields
+        # Instantiate temporal motion compensator
         try:
+            try:
+                motion_cfg = cfg.MODEL.PRE_PROCESSING.MOTION_COMPENSATION
+            except Exception:
+                motion_cfg = getattr(cfg.MODEL.PRE_PROCESSING, 'MOTION_COMPENSATION', None)
             self.temporal_comp = TemporalMotionCompensator(cfg)
             print("* TemporalMotionCompensator instantiated (enabled=%s)" % self.temporal_comp.enabled)
         except Exception as e:
@@ -429,7 +469,7 @@ class PointPillar_RLF(nn.Module):
             list_voxels = []
             list_voxel_coords = []
             list_voxel_num_points = []
-            rdr_n_used = int(self.dataset_cfg.rdr_sparse.n_used)
+            rdr_n_used = int(getattr(self, 'rdr_n_used_vfe', int(self.dataset_cfg.rdr_sparse.n_used)))
             for batch_idx in range(batch_dict['batch_size']):
                 idxs = torch.where(batched_indices_rdr == batch_idx)[0]
                 temp_points = batched_rdr[idxs, :rdr_n_used]
@@ -440,6 +480,9 @@ class PointPillar_RLF(nn.Module):
 
                 if self.transform_points_to_voxels:
                     if self.training:
+                        if not hasattr(self, "_dbg_printed_rdr_dim"):
+                            print(f"[DBG] temp_points.shape={temp_points.shape}, rdr_n_used_vfe={self.rdr_n_used_vfe}")
+                            self._dbg_printed_rdr_dim = True
                         voxels, coordinates, num_points = self.rdr_voxel_generator_train.generate(temp_points.cpu().numpy())
                     else:
                         voxels, coordinates, num_points = self.rdr_voxel_generator_test.generate(temp_points.cpu().numpy())
@@ -884,42 +927,8 @@ class PointPillar_RLF(nn.Module):
                             candidate_mask[idxs_b[topk_idx]] = True
 
             # --- 3) 仅对 candidate 计算 temporal scores ---
-                
-            # 在调用 temporal_comp.get_temporal_scores 前（pp_rlf）
             try:
-                # --- DIAGNOSTIC: candidate_mask summary (improved) ---
-                if candidate_mask is not None and getattr(self, 'dataset_cfg', None) is not None:
-                    try:
-                        n_total = int(candidate_mask.numel())
-                        n_true = int(candidate_mask.sum().item())
-                        ratio = n_true / float(max(1, n_total))
-                        print(f"[CANDMASK DIAG] total={n_total}, true={n_true}, ratio={ratio:.4f}")
-                        # sample a few true global indices (safe)
-                        try:
-                            trues = torch.nonzero(candidate_mask, as_tuple=False).view(-1)
-                            if trues.numel() > 0:
-                                sample_trues = trues[:20].cpu().tolist()
-                                print("[CANDMASK DIAG] sample_true_global_indices:", sample_trues)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-
-                # call temporal_comp (original)
                 t_scores_full = self.temporal_comp.get_temporal_scores(batch_dict, candidate_mask=candidate_mask)
-                # DIAG: immediate t_scores check (small sample)
-                try:
-                    if getattr(self.temporal_comp, 'debug', False):
-                        ts_np = t_scores_full.detach().cpu().numpy()
-                        print(f"[TMC CALL DIAG] t_scores mean={ts_np.mean():.6f}, std={ts_np.std():.6f}, min={ts_np.min():.6f}, max={ts_np.max():.6f}")
-                        # print small histogram (10 bins)
-                        import numpy as _np
-                        bins = _np.linspace(0,1,11)
-                        hist = _np.histogram(ts_np, bins=bins)[0]
-                        print("[TMC CALL DIAG] t_scores_hist_10bins:", hist.tolist())
-                except Exception:
-                    pass
-
                 t_scores_full = t_scores_full.to(device=device).float()
             except Exception as e:
                 print(f"* Warning: temporal_comp.get_temporal_scores(candidate_mask=...) failed: {e}. Falling back to full compute.")
@@ -1168,6 +1177,131 @@ class PointPillar_RLF(nn.Module):
 
         # continue pipeline
         batch_dict = self.pre_processor(batch_dict)
+        # ===== Build BEV confidence / density maps for Uncertainty-aware Gated Fusion =====
+        # radar_conf_bev: derived from temporal scores (t_scores) appended to radar point features
+        # lidar_dens_bev: simple occupancy/density prior from LiDAR voxel num_points
+        try:
+            B = int(batch_dict.get('batch_size', 1))
+            # --- infer BEV size (ny, nx) from map_to_bev_module if possible
+            ny = getattr(self.map_to_bev_module, 'ny', None)
+            nx = getattr(self.map_to_bev_module, 'nx', None)
+            if ny is None or nx is None:
+                # fallback: infer from spatial_features if already present (rare at this point)
+                sf = batch_dict.get('spatial_features', None)
+                if sf is not None and hasattr(sf, 'shape') and len(sf.shape) == 4:
+                    _, _, ny, nx = sf.shape
+            if ny is None or nx is None:
+                # last resort: use voxel generator grid size (nx, ny, nz)
+                try:
+                    gsz = getattr(self.voxel_generator_radar, 'grid_size', None)
+                    if gsz is None:
+                        gsz = getattr(getattr(self.voxel_generator_radar, '_voxel_generator', None), 'grid_size', None)
+                    if gsz is not None and len(gsz) >= 2:
+                        nx, ny = int(gsz[0]), int(gsz[1])
+                except Exception:
+                    ny, nx = None, None
+
+            if (ny is not None) and (nx is not None):
+                # -------- radar confidence map (mean t_scores per pillar) --------
+                if 'radar_voxels' in batch_dict and hasattr(batch_dict['radar_voxels'], 'device'):
+                    device = batch_dict['radar_voxels'].device
+                elif 'lidar_voxels' in batch_dict and hasattr(batch_dict['lidar_voxels'], 'device'):
+                    device = batch_dict['lidar_voxels'].device
+                else:
+                    device = batch_dict['rdr_sparse'].device if 'rdr_sparse' in batch_dict else torch.device('cpu')
+                radar_conf_bev = torch.zeros((B, 1, ny, nx), device=device, dtype=torch.float32)
+                try:
+                    pts = batch_dict['rdr_sparse']  # expected shape (N, C)
+                    N = pts.shape[0]
+                except Exception:
+                    pts = None
+                    N = 0
+ 
+                try:
+                    if 't_scores_full' in locals() and t_scores_full is not None:
+                        t = t_scores_full.to(device).float()
+                    else:
+                        t = batch_dict.get('t_scores_full', None)
+                        if t is None:
+                            t = torch.zeros((N,), device=device, dtype=torch.float32)
+                        else:
+                            t = t.to(device).float()
+                except Exception:
+                    t = torch.zeros((N,), device=device, dtype=torch.float32)
+ 
+                # If we have point positions, map each point to pillar and aggregate
+                if (pts is not None) and (pts.numel() > 0):
+                    
+                    try:
+                        batch_idx_col = pts[:, 0].long()
+                        x_coords = pts[:, 3].float()
+                        y_coords = pts[:, 2].float()
+                    except Exception:
+                        # fallback: assume no batch idx (all batch 0), and x/y are cols 0/1
+                        batch_idx_col = torch.zeros((N,), device=device, dtype=torch.long)
+                        x_coords = pts[:, 3].float()
+                        y_coords = pts[:, 2].float()
+ 
+                    # compute pillar indices
+                    pc_range = np.array(self.dataset_cfg.roi.xyz)
+                    voxel_size = np.array(self.dataset_cfg.roi.voxel_size)
+                    xmin, ymin = float(pc_range[0]), float(pc_range[1])
+                    vx, vy = float(voxel_size[0]), float(voxel_size[1])
+ 
+                    x_idx = torch.floor((x_coords - xmin) / vx).long()
+                    y_idx = torch.floor((y_coords - ymin) / vy).long()
+ 
+                    # mask valid points inside BEV range
+                    mask_in = (x_idx >= 0) & (x_idx < nx) & (y_idx >= 0) & (y_idx < ny)
+                    if mask_in.sum() > 0:
+                        batch_idx_col = batch_idx_col[mask_in]
+                        x_idx = x_idx[mask_in]
+                        y_idx = y_idx[mask_in]
+                        t_valid = t[mask_in]
+                        flat = batch_idx_col.to(torch.long) * (ny * nx) + y_idx.to(torch.long) * nx + x_idx.to(torch.long)
+                        flat = flat.long()
+ 
+                        total_bins = int(B * ny * nx)
+                        sum_flat = torch.zeros((total_bins,), device=device, dtype=torch.float32)
+                        cnt_flat = torch.zeros((total_bins,), device=device, dtype=torch.float32)
+ 
+                        # scatter_add sums values into bins
+                        sum_flat = sum_flat.scatter_add(0, flat, t_valid)
+                        cnt_flat = cnt_flat.scatter_add(0, flat, torch.ones_like(t_valid))
+ 
+                        # compute mean where count > 0
+                        avg_flat = torch.zeros_like(sum_flat)
+                        nz = cnt_flat > 0
+                        if nz.any():
+                            avg_flat[nz] = sum_flat[nz] / cnt_flat[nz]
+ 
+                        radar_conf_bev = avg_flat.view(B, 1, ny, nx).clamp(0.0, 1.0)
+                 # else keep zeros radar_conf_bev as fallback
+
+                    
+
+                # -------- LiDAR density map (normalized num_points per pillar) --------
+                lidar_dens_bev = torch.zeros((B, 1, ny, nx), device=device, dtype=torch.float32)
+                if 'lidar_voxel_coords' in batch_dict and 'lidar_voxel_num_points' in batch_dict:
+                    lcoords = batch_dict['lidar_voxel_coords']
+                    lnum = batch_dict['lidar_voxel_num_points'].float()
+                    max_pts = float(getattr(self.dataset_cfg.MODEL.PRE_PROCESSING, 'MAX_POINTS_PER_VOXEL', 32)) if hasattr(self, 'dataset_cfg') else 32.0
+                    dens = (lnum / max(1.0, max_pts)).clamp(0.0, 1.0)
+                    b = lcoords[:, 0].long()
+                    y = lcoords[:, 2].long()
+                    x = lcoords[:, 3].long()
+                    flat = b * (ny * nx) + y * nx + x
+                    flat = flat.clamp(min=0, max=B * ny * nx - 1)
+                    dens_flat = torch.zeros((B * ny * nx,), device=device, dtype=torch.float32)
+                    dens_flat.index_put_((flat,), dens, accumulate=False)
+                    lidar_dens_bev = dens_flat.view(B, 1, ny, nx)
+
+                batch_dict['radar_conf_bev'] = radar_conf_bev
+                batch_dict['lidar_dens_bev'] = lidar_dens_bev
+        except Exception as e:
+            if getattr(self, 'debug', False):
+                print(f"* Warning: failed to build BEV confidence maps: {e}")
+        # ===== end BEV confidence / density maps =====
         batch_dict = self.vfe(batch_dict)
         batch_dict = self.map_to_bev_module(batch_dict)
         batch_dict = self.backbone_2d(batch_dict)
@@ -1330,3 +1464,24 @@ class PointPillar_RLF(nn.Module):
         else:
             gt_iou = box_preds.new_zeros(box_preds.shape[0])
         return recall_dict
+
+        # --- NEW: ensure rdr_sparse has an extra score column for VFE (filled later with temporal scores) ---
+        if getattr(self, 'rdr_n_used_vfe', None) is not None and self.rdr_n_used_vfe > self.rdr_n_used_base:
+            if 'rdr_sparse' in batch_dict and torch.is_tensor(batch_dict['rdr_sparse']):
+                if batch_dict['rdr_sparse'].shape[1] == self.rdr_n_used_base:
+                    z = batch_dict['rdr_sparse'].new_zeros((batch_dict['rdr_sparse'].shape[0], 1))
+                    batch_dict['rdr_sparse'] = torch.cat([batch_dict['rdr_sparse'], z], dim=1)
+
+                # --- NEW: write temporal score into rdr_sparse last channel for VFE ---
+                if getattr(self, 'rdr_n_used_vfe', None) is not None and self.rdr_n_used_vfe > self.rdr_n_used_base:
+                    try:
+                        batch_dict['rdr_sparse'][:, self.rdr_score_col] = t_scores_full
+                    except Exception:
+                        pass
+
+                # --- NEW: write temporal score into rdr_sparse last channel for VFE ---
+                if getattr(self, 'rdr_n_used_vfe', None) is not None and self.rdr_n_used_vfe > self.rdr_n_used_base:
+                    try:
+                        batch_dict['rdr_sparse'][:, self.rdr_score_col] = t_scores_full
+                    except Exception:
+                        pass
