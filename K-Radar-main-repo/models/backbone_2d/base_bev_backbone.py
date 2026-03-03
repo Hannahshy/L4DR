@@ -1021,6 +1021,15 @@ class BaseBEVBackbone_MF(nn.Module):
                         nn.ReLU()
                     ))
 
+        self.conf_channels = int(getattr(self.model_cfg, 'UAGF_CONF_CHANNELS', 2))
+        # create lists for gating modules aligned with num_levels
+        self.Conv_LG = nn.ModuleList()
+        self.Conv_RG = nn.ModuleList()
+        for idx in range(num_levels):
+            in_ch_gate = int(num_filters[idx]) + self.conf_channels
+            self.Conv_LG.append(nn.Conv2d(in_ch_gate, num_filters[idx], kernel_size=3, padding=1, bias=False))
+            self.Conv_RG.append(nn.Conv2d(in_ch_gate, num_filters[idx], kernel_size=3, padding=1, bias=False))
+        
         c_in = sum(num_upsample_filters)
         if len(upsample_strides) > num_levels:
             self.deblocks.append(nn.Sequential(
@@ -1102,10 +1111,56 @@ class BaseBEVBackbone_MF(nn.Module):
         spatial_features = torch.cat([lidar_x,radar_x], dim = 1)
 
         x = spatial_features
+        conf_t = data_dict.get(getattr(self, 'uagf_conf_key', 'radar_conf_bev'), None)
+        conf_dop = data_dict.get(getattr(self, 'uagf_dop_key', 'radar_dop_bev'), None)
+        # normalize conf to (B,1,H,W) if present; else keep None and we'll use zeros later
+        def _ensure_conf(c):
+            if c is None:
+                return None
+            if c.dim() == 3:
+                return c.unsqueeze(1)
+            return c
+        conf_t = _ensure_conf(conf_t)
+        conf_dop = _ensure_conf(conf_dop)
+        
         for i in range(len(self.blocks)):
             x = self.blocks[i](x)
             lidar_x = self.L_blocks[i](lidar_x)
             radar_x = self.R_blocks[i](radar_x)
+            H_i, W_i = x.shape[-2], x.shape[-1]
+            if conf_t is None:
+                conf_t_i = x.new_zeros((x.shape[0], 1, H_i, W_i))
+            else:
+                if conf_t.shape[-2:] != (H_i, W_i):
+                    conf_t_i = F.interpolate(conf_t, size=(H_i, W_i), mode='bilinear', align_corners=False)
+                else:
+                    conf_t_i = conf_t
+            if conf_dop is None:
+                conf_dop_i = x.new_zeros((x.shape[0], 1, H_i, W_i))
+            else:
+                if conf_dop.shape[-2:] != (H_i, W_i):
+                    conf_dop_i = F.interpolate(conf_dop, size=(H_i, W_i), mode='bilinear', align_corners=False)
+                else:
+                    conf_dop_i = conf_dop
+
+            # concat conf channels to shared x to form gate input
+            gate_in = torch.cat([x, conf_t_i, conf_dop_i], dim=1)  # shape (B, F_i + 2, H_i, W_i)
+
+            # compute per-modality gates (per-channel) and apply sigmoid then multiply
+            gate_L = torch.sigmoid(self.Conv_LG[i](gate_in))
+            gate_R = torch.sigmoid(self.Conv_RG[i](gate_in))
+
+            # Ensure gating shapes broadcast to modality feature shapes
+            if gate_L.shape[1] == lidar_x.shape[1]:
+                lidar_x = gate_L * lidar_x
+            else:
+                # if mismatch fallback to spatial-only gating (broadcast channel)
+                lidar_x = gate_L.mean(dim=1, keepdim=True) * lidar_x
+            if gate_R.shape[1] == radar_x.shape[1]:
+                radar_x = gate_R * radar_x
+            else:
+                radar_x = gate_R.mean(dim=1, keepdim=True) * radar_x
+            
             stride = int(spatial_features.shape[2] / x.shape[2])
             ret_dict['spatial_features_%dx' % stride] = x
             if len(self.deblocks) > 0:
